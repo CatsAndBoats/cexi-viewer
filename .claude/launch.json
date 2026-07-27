@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "fs-api",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["dev/serve.py", "8766"],
+      "port": 8766
+    },
+    {
+      "name": "vite",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev", "--prefix", "ui"],
+      "port": 5173
+    }
+  ]
+}

@@ -1,0 +1,183 @@
+// Bakes the AltanaViewer-format CSV lists into the viewer's own JSON lists.
+//
+//   node dev/bake-lists.mjs [--src <ListsDir>] [--battle <battle.json>] [--out <dir>]
+//
+// Defaults: --src ui/public/lists (the repo snapshot; point at
+// D:\xidata\AltanaViewer-main\List to re-import from AltanaViewer upstream),
+// --battle dev/battle-table.json, --out ui/public/lists.
+//
+// Emits (everything the app needs, fully resolved — no spec grammar at runtime):
+//   characters.json  races (base skeleton DAT, per-weapon-type battle idles),
+//                    per-race gear/face slot items, and the action list with
+//                    Basic + per-weapon-type Battle entries baked in and every
+//                    Motion.csv mapping resolved to concrete DAT paths.
+//   npcs.json        NPC categories/entries (variants + companion base DATs).
+//   music.json       track display names keyed `<soundRoot>_<NNN>`.
+//   sfx.json         SFX folder + effect display names.
+//   floors.json      floor texture list (zone label, DAT spec, fourcc).
+//
+// battle-table.json (weaponAnimationType -> battle DAT, per race) is generated
+// from FFXiMain.dll + FTABLE via cexi-tools:
+//   uv run python -c "from cexi.entity.anim.xi_motion_tables import *; ..."
+// (see git history of ui/public/lists/PC/battle.json for the exact snippet).
+import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import {
+  expandPathSpec, parseRaceIndex, parseSlotCsv, parseMotionCsv, attachMotions,
+  baseMotionCompanions,
+} from '../ui/js/pclists.js';
+
+const root = join(fileURLToPath(import.meta.url), '..', '..');
+const arg = (name, dflt) => {
+  const i = process.argv.indexOf(`--${name}`);
+  return i >= 0 ? process.argv[i + 1] : dflt;
+};
+const SRC = arg('src', join(root, 'ui', 'public', 'lists'));
+const BATTLE = arg('battle', join(root, 'dev', 'battle-table.json'));
+const OUT = arg('out', join(root, 'ui', 'public', 'lists'));
+
+const rd = (p) => { try { return readFileSync(join(SRC, p), 'utf8'); } catch { return null; } };
+
+// Pretty-print for hand-editing: nested structure is indented, but leaf objects
+// that fit (gear items, actions, npc entries) stay on one line each.
+const INLINE = 160;
+function pretty(v, indent = '') {
+  const compact = JSON.stringify(v);
+  if (compact === undefined) return 'null';
+  if (compact.length <= INLINE || typeof v !== 'object' || v === null) return compact;
+  const pad = indent + '  ';
+  if (Array.isArray(v)) {
+    return `[\n${v.map((x) => pad + pretty(x, pad)).join(',\n')}\n${indent}]`;
+  }
+  return `{\n${Object.entries(v).map(([k, x]) => `${pad}${JSON.stringify(k)}: ${pretty(x, pad)}`).join(',\n')}\n${indent}}`;
+}
+
+const write = (name, data) => {
+  writeFileSync(join(OUT, name), pretty(data) + '\n');
+  console.log(`wrote ${name}`);
+};
+
+// --- characters.json --------------------------------------------------------
+
+const SLOTS = [
+  ['face', 'Face'], ['main', 'Main'], ['sub', 'Sub'], ['range', 'Range'],
+  ['head', 'Head'], ['body', 'Body'], ['hands', 'Hands'], ['legs', 'Legs'], ['feet', 'Feet'],
+];
+
+// weaponAnimationType -> battle-stance display name (one style per type).
+const WEAPON_STYLE = {
+  0: 'Club / Staff', 1: 'Sword', 2: 'Hand-to-Hand', 3: 'Dagger', 4: 'Great Sword',
+  5: 'Axe / Scythe', 6: 'Katana', 7: 'Kunai', 8: 'Polearm',
+};
+
+const battleTable = existsSync(BATTLE) ? JSON.parse(readFileSync(BATTLE, 'utf8')) : {};
+const pcIndex = rd('PC/index.csv');
+if (!pcIndex) { console.error(`no PC/index.csv under ${SRC}`); process.exit(1); }
+
+const races = [];
+for (const race of parseRaceIndex(pcIndex)) {
+  const slots = {};
+  for (const [key, file] of SLOTS) {
+    const text = rd(`PC/${race.id}/${file}.csv`);
+    if (text !== null) slots[key] = parseSlotCsv(text);
+  }
+
+  const csvActs = parseSlotCsv(rd(`PC/${race.id}/Action.csv`) ?? '');
+  const motText = rd(`PC/${race.id}/Motion.csv`);
+  attachMotions(csvActs, motText ? parseMotionCsv(motText) : []);
+
+  // Synthesized entries the CSVs lack: Basic (race movement DAT) and one
+  // Battle entry per weapon-animation type. The CSVs' single merged "Battle"
+  // row is dropped — it collapsed every weapon style onto hand-to-hand.
+  const battleByType = (battleTable[race.id] ?? []).map((p) => (p ? p.replace(/\//g, '\\') : null));
+  // PC body motion is split across body-region slot DATs: the base holds only the
+  // lower body, base+1 the upper body, base+3 the waist/skirt. These load with the
+  // base for every pose so locomotion animates the whole body (see
+  // baseMotionCompanions). Real PC races only — NPC-like bases (no battle table,
+  // e.g. Chocobo / Little Girl) don't follow the base+N motion-slot layout.
+  const motionExtra = battleByType.some(Boolean) ? baseMotionCompanions(race.base) : [];
+  const actions = [
+    { id: 'syn:basic', label: 'Basic', group: 'Basic', paths: [race.base], motionPaths: [] },
+  ];
+  const seen = new Set();
+  battleByType.forEach((dat, type) => {
+    const style = WEAPON_STYLE[type];
+    if (!dat || !style || seen.has(dat)) return;
+    seen.add(dat);
+    actions.push({ id: `syn:btl${type}`, label: `Battle: ${style}`, group: 'Battle', paths: [dat], motionPaths: [] });
+  });
+  actions.push(...csvActs.filter((a) => !(a.group === 'Battle' && a.label === 'Battle')));
+
+  races.push({ id: race.id, label: race.label, base: race.base, motionExtra, battleByType, slots, actions });
+}
+write('characters.json', { races });
+
+// --- npcs.json --------------------------------------------------------------
+// (private copy of NpcList's category parser — the runtime one goes away)
+
+const PATH_RE = /^\d+(\/\d+(-\d+)?){1,2}$/;
+function parseCategoryCsv(text) {
+  const entries = [];
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const cells = line.split(',');
+    if (cells.length < 2 || !PATH_RE.test(cells[0].split(';')[0].trim())) {
+      entries.push({ separator: line.replace(/^,+|,+$/g, '') });
+      continue;
+    }
+    let base = null;
+    let nameCells = cells.slice(1);
+    if (nameCells.length > 1 && PATH_RE.test(nameCells[nameCells.length - 1].trim())) {
+      base = expandPathSpec(nameCells[nameCells.length - 1].trim())[0] ?? null;
+      nameCells = nameCells.slice(0, -1);
+    }
+    const variants = expandPathSpec(cells[0]);
+    if (variants.length === 0) continue;
+    entries.push({ name: nameCells.join(',').trim(), variants, base });
+  }
+  return entries;
+}
+
+const npcIndex = rd('NPC/index.csv');
+const categories = [];
+if (npcIndex) {
+  // index rows: `categoryFile,Display Name`; match file case-insensitively.
+  const files = JSON.parse(rd('NPC/files.json') ?? '[]');
+  const fileMap = new Map(files.map((f) => [f.toLowerCase(), f]));
+  for (const line of npcIndex.split(/\r?\n/)) {
+    const [file, ...nameParts] = line.trim().split(',');
+    if (!file || nameParts.length === 0) continue;
+    const actual = fileMap.get(`${file.toLowerCase()}.csv`) ?? `${file}.csv`;
+    const text = rd(`NPC/${actual}`);
+    if (text === null) continue;
+    categories.push({ name: nameParts.join(','), entries: parseCategoryCsv(text) });
+  }
+}
+write('npcs.json', { categories });
+
+// --- music.json / sfx.json / floors.json ------------------------------------
+
+const kvMap = (text, keyTransform = (k) => k) => {
+  const out = {};
+  for (const line of (text ?? '').split(/\r?\n/)) {
+    const i = line.indexOf(',');
+    if (i < 0) continue;
+    out[keyTransform(line.slice(0, i).trim())] = line.slice(i + 1).trim();
+  }
+  return out;
+};
+
+write('music.json', { names: kvMap(rd('Music/names.csv')) });
+write('sfx.json', { folders: kvMap(rd('SFX/folders.csv')), names: kvMap(rd('SFX/names.csv')) });
+
+const floors = [];
+for (const line of (rd('Floor.csv') ?? '').split(/\r?\n/)) {
+  const cells = line.split(',');
+  if (cells.length < 3) continue;
+  const zone = cells[0].trim(), spec = cells[1].trim(), fourcc = cells[2].trim();
+  if (!/^\d+(\/\d+){1,2}$/.test(spec) || !fourcc) continue;
+  floors.push({ zone, spec, fourcc });
+}
+write('floors.json', floors);
