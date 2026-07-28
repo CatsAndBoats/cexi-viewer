@@ -358,7 +358,18 @@
 }
 .wx-row { display: flex; align-items: center; gap: 8px; }
 .wx-row .combo-input { flex: 1 1 auto; width: auto; min-width: 0; }
-.wx-time-row .wx-tod-icon { color: var(--muted); font-size: 16px; flex: 0 0 auto; }
+/* Every Zone row leads with a 20x20 control — icon or toggle button — so the
+   sliders after them all start on the same vertical line. */
+.wx-tod-icon {
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  color: var(--muted);
+  font-size: 16px;
+  line-height: 1;
+}
 .wx-time-row .vol-slider { flex: 1 1 auto; }
 .wx-bg-row {
   padding-top: 2px;
@@ -384,7 +395,48 @@
 }
 .wx-bg-swatch::-webkit-color-swatch-wrapper { padding: 2px; }
 .wx-bg-swatch::-webkit-color-swatch { border: none; border-radius: 2px; }
-.wx-bright-row .vol-slider { flex: 1 1 auto; min-width: 0; }
+.wx-bright-row .vol-slider,
+.wx-fog-row .vol-slider { flex: 1 1 auto; min-width: 0; }
+.wx-fog-row .wx-switch { flex: 0 0 auto; }
+/* The row's leading icon doubles as its transport toggle: minimal by default,
+   tinted and animated while active so the state reads without a second control. */
+.wx-audio-btn {
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  min-height: 20px;   /* the global button rule forces 30px otherwise */
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: none;
+  color: var(--muted);
+  cursor: pointer;
+  transition: color 0.15s ease, background-color 0.15s ease;
+}
+.wx-audio-btn .icon { font-size: 16px; line-height: 1; }
+.wx-audio-btn:hover:not(:disabled) { color: var(--gray-100, #e8e8e8); background: rgba(255, 255, 255, 0.08); }
+.wx-audio-btn:disabled { opacity: 0.3; cursor: default; }
+.wx-audio-btn.playing { color: var(--accent, #4c8dff); }
+.wx-audio-btn.playing .icon { animation: wx-pulse 1.6s ease-in-out infinite; transform-origin: center; }
+/* graphic_eq reads as levels, so give it a quicker, bar-like beat. */
+.wx-audio-btn.playing .icon.eq { animation: wx-eq 0.9s ease-in-out infinite; }
+
+@keyframes wx-pulse {
+  0%, 100% { transform: scale(1); opacity: 0.9; }
+  50%      { transform: scale(1.18); opacity: 1; }
+}
+@keyframes wx-eq {
+  0%, 100% { transform: scaleY(0.8); opacity: 0.85; }
+  25%      { transform: scaleY(1.15); opacity: 1; }
+  60%      { transform: scaleY(0.9); opacity: 0.95; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .wx-audio-btn.playing .icon,
+  .wx-audio-btn.playing .icon.eq { animation: none; }
+}
+
 .wx-bright-val {
   flex: 0 0 auto;
   width: 36px;
@@ -393,8 +445,14 @@
   font-size: 11px;
 }
 
-/* Objects sits below Zone Scene when both are shown. */
-body:has(#weather) #placements { top: 236px; max-height: calc(100vh - 306px); }
+/* Objects sits below Zone when both are shown. The Zone panel's height changes
+   with its contents (indoor zones lose the weather and time-of-day rows), so
+   WeatherPanel measures itself into --wx-h rather than us guessing a constant.
+   The fallback matches a typical outdoor panel. */
+body:has(#weather) #placements {
+  top: calc(var(--wx-h, 286px) + 24px);
+  max-height: calc(100vh - var(--wx-h, 286px) - 94px);
+}
 
 #placements {
   top: 12px; right: 12px;

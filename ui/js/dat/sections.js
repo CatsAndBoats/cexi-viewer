@@ -310,10 +310,17 @@ export function parsePath(bytes, dv, section, entry) {
  * already have (zone meshes, textures, environments) so the tree exposes one
  * lookup for everything.
  */
-export function makeParsers(extra = {}) {
+/**
+ * @param {Object}  extra        additional/overriding section parsers
+ * @param {boolean} zoneResource true for a zone DAT, false for the shared
+ *   effects DAT. xim loads ROM/0/0.DAT with `staticResource` (zoneResource
+ *   false), and only zone resources get the x2 vertex-colour scale — passing
+ *   true for both makes every shared effect twice as bright.
+ */
+export function makeParsers(extra = {}, zoneResource = true) {
   return {
     [SEC.KEYFRAME]: parseKeyFrame,
-    [SEC.PARTICLE_MESH]: parseParticleMesh,
+    [SEC.PARTICLE_MESH]: (b, d, s, e) => parseParticleMesh(b, d, s, e, zoneResource),
     [SEC.SPRITE_SHEET]: parseSpriteSheet,
     [SEC.SOUND_POINTER]: parseSoundPointer,
     [SEC.POINT_LIST]: parsePointList,

@@ -19,7 +19,8 @@ export const soundPath = (soundId) => {
 
 /** A single playing sound with an independent gain ramp. */
 class Voice {
-  constructor(ctx, buffer, { looping, volume }) {
+  constructor(ctx, sound, { looping, volume }) {
+    const { buffer, loopStart = 0 } = sound;
     this.ctx = ctx;
     this.gain = ctx.createGain();
     this.gain.gain.value = volume;
@@ -28,6 +29,13 @@ class Voice {
     this.source = ctx.createBufferSource();
     this.source.buffer = buffer;
     this.source.loop = looping;
+    // Ambient beds open with an intro that plays once; the file says where the
+    // repeating body starts. Looping the whole buffer replays that intro every
+    // cycle, which is the blip you don't hear in game.
+    if (looping && loopStart > 0 && loopStart < buffer.duration) {
+      this.source.loopStart = loopStart;
+      this.source.loopEnd = buffer.duration;
+    }
     this.source.connect(this.gain);
     this.stopped = false;
     this.source.onended = () => { this.stopped = true; };
@@ -68,7 +76,8 @@ class Voice {
  *
  * @param {Object} opts
  * @param {() => AudioContext} opts.getContext
- * @param {(relPath: string) => Promise<AudioBuffer|null>} opts.loadSound
+ * @param {(relPath: string) => Promise<{buffer: AudioBuffer, loopStart: number}|null>} opts.loadSound
+ *        loopStart is in seconds; 0 means "loop the whole buffer".
  */
 export class WeatherAudio {
   constructor({ getContext, loadSound, volume = 0.6 }) {
@@ -82,7 +91,7 @@ export class WeatherAudio {
 
     this._current = null;        // { soundId, voice }
     this._pending = null;        // soundId currently being loaded
-    this._buffers = new Map();   // soundId -> AudioBuffer | null
+    this._buffers = new Map();   // soundId -> { buffer, loopStart } | null
     this._lastKey = null;
   }
 
@@ -166,27 +175,27 @@ export class WeatherAudio {
     if (soundId == null) return;
 
     this._pending = soundId;
-    const buffer = await this._buffer(soundId);
+    const sound = await this._buffer(soundId);
     // A newer switch landed while this was decoding.
-    if (this._pending !== soundId || !buffer || !this.enabled) return;
+    if (this._pending !== soundId || !sound || !this.enabled) return;
 
     const ctx = this.getContext?.();
     if (!ctx) return;
-    const voice = new Voice(ctx, buffer, { looping: true, volume: 0 });
+    const voice = new Voice(ctx, sound, { looping: true, volume: 0 });
     voice.fadeTo(this.volume, 3.33);
     this._current = { soundId, voice };
   }
 
   async _buffer(soundId) {
     if (this._buffers.has(soundId)) return this._buffers.get(soundId);
-    let buffer = null;
+    let sound = null;
     try {
-      buffer = await this.loadSound(soundPath(soundId));
+      sound = await this.loadSound(soundPath(soundId));
     } catch {
-      buffer = null;
+      sound = null;
     }
-    this._buffers.set(soundId, buffer);
-    return buffer;
+    this._buffers.set(soundId, sound);
+    return sound;
   }
 
   /**
@@ -203,13 +212,13 @@ export class WeatherAudio {
       isComplete() { return this.stopped || (this.voice ? this.voice.isComplete() : false); },
     };
 
-    this._buffer(soundPointer.soundId).then((buffer) => {
-      if (!buffer || handle.stopped || !this.enabled) return;
+    this._buffer(soundPointer.soundId).then((sound) => {
+      if (!sound || handle.stopped || !this.enabled) return;
       const ctx = this.getContext?.();
       if (!ctx) return;
       const attenuation = volumeFn ? (volumeFn(positionFn?.()) ?? 1) : 1;
       if (attenuation <= 0) { handle.stopped = true; return; }
-      handle.voice = new Voice(ctx, buffer, { looping, volume: this.volume * attenuation });
+      handle.voice = new Voice(ctx, sound, { looping, volume: this.volume * attenuation });
     });
 
     return handle;

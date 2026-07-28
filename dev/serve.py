@@ -9,7 +9,7 @@ Usage: python dev/serve.py [port]
 import json
 import os
 import sys
-from http.server import HTTPServer, SimpleHTTPRequestHandler
+from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
@@ -155,4 +155,7 @@ class Handler(SimpleHTTPRequestHandler):
 if __name__ == "__main__":
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8765
     print(f"serving {UI_DIR} + game dir {GAME_DIR} on http://127.0.0.1:{port}")
-    HTTPServer(("127.0.0.1", port), Handler).serve_forever()
+    # Threaded: a zone load fires many overlapping reads, and listing the game
+    # dir takes seconds. On the single-threaded server one slow request stalled
+    # every other one and the loader appeared to hang.
+    ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()

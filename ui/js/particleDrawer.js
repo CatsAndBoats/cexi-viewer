@@ -101,6 +101,46 @@ void main() {
 }
 `;
 
+// Lens flare. FFXI doesn't draw the flare in the world — it draws the sprite
+// sheet in screen space, strung along the vector from the sun/moon's screen
+// position through the centre of the view, with each sprite's position given by
+// the per-sprite offset stored in the sheet. That's why the streaks sweep across
+// the screen as you turn: they're a 2D construction, not geometry.
+// xim sizes flare sprites at screenSize/32 pixels per sprite unit. In NDC that
+// works out to local/16 on both axes regardless of resolution, and the particle's
+// own scale is deliberately not involved. uDepth carries the source's NDC depth
+// so the occlusion probe tests where the sun actually is.
+const FLARE_SPRITE_VERTEX_SHADER = `#version 300 es
+precision highp float;
+layout(location=0) in vec3 aPos;      // sprite-local quad corner
+layout(location=2) in vec2 aUV;
+layout(location=3) in vec4 aColor;
+uniform vec2 uCenter;                 // NDC position for this sprite
+uniform vec2 uScale;                  // NDC units per sprite unit (y flipped)
+uniform float uDepth;                 // NDC z
+out vec2 vUV;
+out vec4 vColor;
+void main() {
+  vUV = aUV;
+  vColor = aColor;
+  gl_Position = vec4(uCenter + aPos.xy * uScale, uDepth, 1.0);
+}
+`;
+
+const FLARE_SPRITE_FRAGMENT_SHADER = `#version 300 es
+precision highp float;
+in vec2 vUV;
+in vec4 vColor;
+uniform sampler2D uTexture;
+uniform vec4 uTextureFactor;
+out vec4 outColor;
+void main() {
+  vec4 texel = texture(uTexture, vUV);
+  vec4 stage0 = 2.0 * (vColor * texel);
+  outColor = vec4(2.0 * stage0.rgb * uTextureFactor.rgb, 4.0 * stage0.a * uTextureFactor.a);
+}
+`;
+
 // xim ScreenFlasher: lightning adds a full-screen wash whose strength comes from
 // how close and how central the bolt is (ScreenFlashApplier).
 const FLASH_VERTEX_SHADER = `#version 300 es
@@ -140,6 +180,13 @@ function buildProgram(gl, vsSrc, fsSrc) {
 const DISPLAY_ROT = new Mat4();
 DISPLAY_ROT.m[0] = -1; DISPLAY_ROT.m[5] = -1; DISPLAY_ROT.m[10] = 1;
 
+/**
+ * xim draws flare sprites at screenSize/32 pixels per sprite unit. Converting to
+ * NDC: pixels / (screenSize / 2) = unit * 2 / 32, i.e. 1/16 — resolution
+ * independent, and notably not scaled by the particle's own scale.
+ */
+const FLARE_NDC_PER_UNIT = 1 / 16;
+
 /** xim Matrix4f.lookAtNegZ upper 3×3 — diag(−1, 1, −1). */
 const LOOK_AT_NEG_Z = new Mat4();
 LOOK_AT_NEG_Z.m[0] = -1; LOOK_AT_NEG_Z.m[5] = 1; LOOK_AT_NEG_Z.m[10] = -1;
@@ -170,8 +217,33 @@ export class ParticleDrawer {
 
     this.meshCache = new Map();     // mesh descriptor -> { vao, vbo, count, texName }
     this.textures = new Map();      // texture name -> GLTexture
-    this.whiteTexture = null;
     this.lastStats = { drawn: 0, particles: 0 };
+
+    // xim binds a single-colour 0x80 texture for any mesh without one. 0x80 is
+    // the *neutral* value in this pipeline — stage0 doubles the texel, so grey
+    // maps to 1.0. Binding white instead makes every untextured particle twice
+    // as bright in both colour and alpha, which is what turned the sun's
+    // untextured additive dome into a screen-wide white-out.
+    this.defaultTexture = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, this.defaultTexture);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE,
+      new Uint8Array([0x80, 0x80, 0x80, 0x80]));
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.bindTexture(gl.TEXTURE_2D, null);
+
+    this.flareProgram = buildProgram(gl, FLARE_SPRITE_VERTEX_SHADER, FLARE_SPRITE_FRAGMENT_SHADER);
+    this.flareU = {
+      center: gl.getUniformLocation(this.flareProgram, 'uCenter'),
+      scale: gl.getUniformLocation(this.flareProgram, 'uScale'),
+      depth: gl.getUniformLocation(this.flareProgram, 'uDepth'),
+      texture: gl.getUniformLocation(this.flareProgram, 'uTexture'),
+      textureFactor: gl.getUniformLocation(this.flareProgram, 'uTextureFactor'),
+    };
+    // One occlusion query per flare source. WebGL2 only offers ANY_SAMPLES_PASSED
+    // so visibility is binary rather than a coverage fraction — xim notes the
+    // same limitation. Results are read a frame late, which is invisible in motion.
+    this.flareQueries = new Map();
 
     this.flashProgram = buildProgram(gl, FLASH_VERTEX_SHADER, FLASH_FRAGMENT_SHADER);
     this.flashColor = gl.getUniformLocation(this.flashProgram, 'uColor');
@@ -213,9 +285,8 @@ export class ParticleDrawer {
     gl.disable(gl.BLEND);
   }
 
-  setTextures(map, whiteTexture) {
+  setTextures(map) {
     this.textures = map;
-    this.whiteTexture = whiteTexture;
     // Texture names are resolved per mesh and cached; a new zone invalidates them.
     for (const entry of this.meshCache.values()) entry.texResolved = undefined;
   }
@@ -231,6 +302,13 @@ export class ParticleDrawer {
 
   dispose() {
     this.disposeMeshes();
+    this.gl.deleteTexture(this.defaultTexture);
+    for (const state of this.flareQueries.values()) {
+      if (state.query) this.gl.deleteQuery(state.query);
+    }
+    this.flareQueries.clear();
+    this.gl.deleteProgram(this.flareProgram);
+    this.gl.deleteProgram(this.flashProgram);
     this.gl.deleteProgram(this.program);
   }
 
@@ -283,7 +361,7 @@ export class ParticleDrawer {
       const key = entry.texName ? resolveTexture(entry.texName, this.textures) : null;
       entry.texResolved = key ? this.textures.get(key) : null;
     }
-    return entry.texResolved ?? this.whiteTexture;
+    return entry.texResolved ?? this.defaultTexture;
   }
 
   #setBlend(blendFunc, isDistortion) {
@@ -321,12 +399,20 @@ export class ParticleDrawer {
 
     const viewMat = new Mat4(new Float32Array(view));
     const commands = [];
+    const flares = [];
 
     for (const { particle, opacity } of contexts) {
       if (particle.isExpired() || particle.drawDistanceCulled) continue;
       if (!particle.hasMeshes()) continue;
       // Point lights and audio-only particles have no geometry to draw.
       if (particle.config.linkedDataType === LinkedDataType.PointLight) continue;
+
+      // Lens flares are not world geometry — collected here, drawn in screen
+      // space by #drawLensFlares once the depth buffer is complete.
+      if (particle.isLensFlare()) { flares.push({ particle, opacity }); continue; }
+
+      // Same story: these are only drawn when their occlusion query passes.
+      if (particle.occlusionSettings) continue;
 
       const meshes = particle.getMeshes();
       if (!meshes.length) continue;
@@ -420,7 +506,7 @@ export class ParticleDrawer {
 
         for (const mesh of cmd.meshes) {
           const entry = this.#upload(mesh);
-          gl.bindTexture(gl.TEXTURE_2D, showTextures ? this.#texture(entry) : this.whiteTexture);
+          gl.bindTexture(gl.TEXTURE_2D, showTextures ? this.#texture(entry) : this.defaultTexture);
           gl.bindVertexArray(entry.vao);
           gl.drawArrays(gl.TRIANGLES, 0, entry.count);
           this.lastStats.drawn++;
@@ -433,6 +519,138 @@ export class ParticleDrawer {
     gl.depthMask(true);
     gl.disable(gl.BLEND);
     gl.blendEquation(gl.FUNC_ADD);
+
+    this.#drawLensFlares(flares, viewMat, proj);
+  }
+
+  /**
+   * Screen-space lens flare, gated on whether the source is actually visible.
+   *
+   * The source (sun or moon) is projected to NDC; an occlusion query drawn at
+   * its depth tells us whether terrain is in the way. If it's clear, the sheet's
+   * sprites are laid out along the line from the source through the screen
+   * centre — offset 0 sits on the source, 0.5 at the centre, 1 diametrically
+   * opposite — which is what makes the streaks swing as the camera turns.
+   */
+  #drawLensFlares(flares, viewMat, proj) {
+    const gl = this.gl;
+    // Flare sources come and go with the weather; drop query state for any that
+    // are no longer being drawn so the map doesn't pin dead particles.
+    for (const [particle, state] of this.flareQueries) {
+      if (state.seen) { state.seen = false; continue; }
+      if (state.query) gl.deleteQuery(state.query);
+      this.flareQueries.delete(particle);
+    }
+    if (!flares.length) return;
+    const projMat = new Mat4(new Float32Array(proj));
+
+    gl.useProgram(this.flareProgram);
+    gl.uniform1i(this.flareU.texture, 0);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.enable(gl.BLEND);
+    gl.blendEquation(gl.FUNC_ADD);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE);   // flares are always additive
+    gl.disable(gl.DEPTH_TEST);
+    gl.depthMask(false);
+    gl.disable(gl.CULL_FACE);
+
+    for (const { particle, opacity } of flares) {
+      const sheet = particle.meshProvider?.spriteSheet;
+      if (!sheet?.meshes?.length) continue;
+
+      // Project the source into NDC.
+      const world = particle.getWorldSpacePosition();
+      const display = DISPLAY_ROT.transform(world, 1);
+      const cam = viewMat.transform(display, 1);
+      if (cam.z >= 0) continue;                       // behind the viewer
+      const m = projMat.m;
+      const clipW = m[3] * cam.x + m[7] * cam.y + m[11] * cam.z + m[15];
+      if (clipW <= 0) continue;
+      const ndcX = (m[0] * cam.x + m[4] * cam.y + m[8] * cam.z + m[12]) / clipW;
+      const ndcY = (m[1] * cam.x + m[5] * cam.y + m[9] * cam.z + m[13]) / clipW;
+      const ndcZ = (m[2] * cam.x + m[6] * cam.y + m[10] * cam.z + m[14]) / clipW;
+      if (Math.abs(ndcX) > 1.6 || Math.abs(ndcY) > 1.6) continue;   // well off-screen
+
+      if (!this.#flareVisible(particle, ndcX, ndcY, ndcZ)) continue;
+
+      const tint = particle.getColor().withMultipliedAlpha(opacity).clamp();
+      gl.uniform4fv(this.flareU.textureFactor, tint.rgba);
+      // Screen-space quads sit in front of everything; depth is only meaningful
+      // for the occlusion probe.
+      gl.uniform1f(this.flareU.depth, 0);
+      gl.uniform2f(this.flareU.scale, FLARE_NDC_PER_UNIT, -FLARE_NDC_PER_UNIT);
+
+      // xim zips meshes with offsets, so a sheet that carries no offsets draws
+      // nothing — that's how a non-flare sheet is filtered out.
+      const offsets = sheet.offsets ?? [];
+      const count = Math.min(sheet.meshes.length, offsets.length);
+      for (let i = 0; i < count; i++) {
+        const entry = this.#upload(sheet.meshes[i]);
+        const o = offsets[i];
+        // offset 0 sits on the source, 0.5 at the screen centre, 1 opposite.
+        gl.uniform2f(this.flareU.center, ndcX * (1 - 2 * o), ndcY * (1 - 2 * o));
+        gl.bindTexture(gl.TEXTURE_2D, this.#texture(entry));
+        gl.bindVertexArray(entry.vao);
+        gl.drawArrays(gl.TRIANGLES, 0, entry.count);
+        this.lastStats.drawn++;
+      }
+    }
+
+    gl.bindVertexArray(null);
+    gl.enable(gl.DEPTH_TEST);
+    gl.depthMask(true);
+    gl.disable(gl.BLEND);
+  }
+
+  /**
+   * Binary visibility for a flare source. A one-pixel depth-tested probe is
+   * drawn with the colour mask off inside an occlusion query; the result is read
+   * on a later frame, so the flare pops in a frame or two after the source
+   * clears an obstruction. WebGL2 has no coverage-count query, so partial
+   * occlusion can't fade the flare the way retail does.
+   */
+  #flareVisible(particle, ndcX, ndcY, ndcZ) {
+    const gl = this.gl;
+    // Keyed on the particle, not its dat id — a zone can hold several flares off
+    // the same sheet (120.DAT has two lf03s), and they occlude independently.
+    let state = this.flareQueries.get(particle);
+    // xim's consumeQuery returns null until a query has come back, and a null
+    // result draws nothing, so a flare stays dark for its first frame or two.
+    if (!state) { state = { query: null, visible: false }; this.flareQueries.set(particle, state); }
+    state.seen = true;
+
+    if (state.query) {
+      if (gl.getQueryParameter(state.query, gl.QUERY_RESULT_AVAILABLE)) {
+        state.visible = gl.getQueryParameter(state.query, gl.QUERY_RESULT) > 0;
+        gl.deleteQuery(state.query);
+        state.query = null;
+      }
+    }
+
+    if (!state.query) {
+      // Small depth-tested probe at the source's real position, colour masked
+      // off so it only answers "is anything in front of the sun here?".
+      const query = gl.createQuery();
+      gl.enable(gl.DEPTH_TEST);
+      gl.depthFunc(gl.LEQUAL);
+      gl.depthMask(false);
+      gl.colorMask(false, false, false, false);
+      gl.uniform2f(this.flareU.center, ndcX, ndcY);
+      gl.uniform2f(this.flareU.scale, 0.004, -0.004);
+      gl.uniform1f(this.flareU.depth, Math.min(0.999999, ndcZ));
+      gl.uniform4f(this.flareU.textureFactor, 1, 1, 1, 1);
+      const probe = this.#upload(particle.meshProvider.spriteSheet.meshes[0]);
+      gl.bindTexture(gl.TEXTURE_2D, this.defaultTexture);
+      gl.bindVertexArray(probe.vao);
+      gl.beginQuery(gl.ANY_SAMPLES_PASSED, query);
+      gl.drawArrays(gl.TRIANGLES, 0, probe.count);
+      gl.endQuery(gl.ANY_SAMPLES_PASSED);
+      gl.colorMask(true, true, true, true);
+      gl.disable(gl.DEPTH_TEST);
+      state.query = query;
+    }
+
+    return state.visible;
   }
 
   #offsetModelView(modelView, viewMat, offset) {

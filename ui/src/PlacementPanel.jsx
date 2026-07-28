@@ -94,7 +94,7 @@ export function PlacementPanel({ groups, selectedKey, onSelectGroup, onSelectIns
             className="icon-btn plc-tool"
             onClick={() => setMinimized((v) => !v)}
           >
-            <span className="icon">{minimized ? 'open_in_full' : 'minimize'}</span>
+            <span className="icon">{minimized ? 'open_in_full' : 'remove'}</span>
           </button>
         </Tooltip>
         {onClose && (

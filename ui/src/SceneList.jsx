@@ -1,7 +1,6 @@
 import { useEffect, useState } from 'react';
-import { Button, Checkbox, Field } from '@headlessui/react';
+import { Button } from '@headlessui/react';
 
-const DEFAULT_FOG_FAR = 45;
 
 // floors.json rows: { zone, spec: "rom/dir/file", fourcc } — the fourcc names a
 // 0x20 texture section that becomes the tiled ground plane.
@@ -19,22 +18,13 @@ async function loadFloors() {
   return [...groups.entries()].map(([zone, floors]) => ({ zone, floors }));
 }
 
-export function SceneList({ bgColor, onBg, onFloor, onClearFloor, onFog, selectedFloor, onError }) {
+// Fog lives in the Zone Scene panel, not here: this panel's controls pushed to
+// the renderer on mount, which meant opening Assets > Scene overwrote whatever
+// fog the zone's 0x2F environment had set.
+export function SceneList({ bgColor, onBg, onFloor, onClearFloor, selectedFloor, onError }) {
   const [groups, setGroups] = useState(null);
-  const [fogOn, setFogOn] = useState(() => localStorage.getItem('fogOn') === '1');
-  const [fogFar, setFogFar] = useState(() => {
-    const v = parseFloat(localStorage.getItem('fogFar'));
-    return Number.isFinite(v) ? v : DEFAULT_FOG_FAR;
-  });
 
   useEffect(() => { loadFloors().then(setGroups).catch(() => setGroups([])); }, []);
-
-  // Push fog state to the renderer (and persist) whenever it changes.
-  useEffect(() => {
-    onFog?.({ enabled: fogOn, far: fogFar, near: fogFar * 0.25 });
-    localStorage.setItem('fogOn', fogOn ? '1' : '0');
-    localStorage.setItem('fogFar', String(fogFar));
-  }, [fogOn, fogFar, onFog]);
 
   return (
     <div id="tree" className="panel scene-panel">
@@ -42,22 +32,6 @@ export function SceneList({ bgColor, onBg, onFloor, onClearFloor, onFog, selecte
         <div className="scene-ctrl">
           <span className="scene-ctrl-label">Background</span>
           <input type="color" value={bgColor} onChange={(e) => onBg?.(e.target.value)} />
-        </div>
-
-        <Field className="scene-ctrl">
-          <label className="switch">
-            <input type="checkbox" checked={fogOn} onChange={(e) => setFogOn(e.target.checked)} />
-            <span className="track" />
-          </label>
-          <span className="scene-ctrl-label">Fog</span>
-        </Field>
-
-        <div className="scene-ctrl scene-fog-slider">
-          <span className="scene-ctrl-label">Distance</span>
-          <input type="range" min="8" max="120" step="1" value={fogFar} disabled={!fogOn}
-            onChange={(e) => setFogFar(+e.target.value)} className="vol-slider"
-            style={{ '--fill': `${((fogFar - 8) / (120 - 8)) * 100}%` }} />
-          <span className="mono scene-fog-num">{fogFar}</span>
         </div>
 
         <Button className="scene-clear" onClick={onClearFloor}>

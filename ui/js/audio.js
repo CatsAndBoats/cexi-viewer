@@ -77,6 +77,24 @@ export function parseAudioHeader(buffer) {
         ? Math.max(0, (size - DATA_OFFSET)) / (2 * Math.max(1, channels)) | 0
         : Math.max(0, sampleBlocks * blockSamples);   // blockSamples is only valid for ADPCM
     },
+    /**
+     * Where a looping sound restarts, in sample frames. Ambient weather beds
+     * open with an intro (0.3-4s) that must play once and never again — looping
+     * the whole buffer replays it every cycle, which is the audible blip.
+     *
+     * The unit differs by codec: ADPCM counts blocks, PCM counts frames. (The
+     * cexi-tools reference multiplies unconditionally, which overshoots the end
+     * of the file on the handful of looped PCM sounds.) Anything that lands out
+     * of range is treated as "no loop point" rather than trusted.
+     */
+    get loopStartFrame() {
+      if (loopStart < 0) return 0;
+      const frame = sampleFormat === FMT_ADPCM ? loopStart * blockSamples : loopStart;
+      return frame > 0 && frame < this.totalFrames ? frame : 0;
+    },
+    get loopStartSec() {
+      return this.sampleRate ? this.loopStartFrame / this.sampleRate : 0;
+    },
     get durationSec() {
       return this.sampleRate ? this.totalFrames / this.sampleRate : 0;
     },

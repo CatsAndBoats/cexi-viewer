@@ -7,7 +7,7 @@
 // `particle.runtime` lands here.
 
 import { Vec3, Mat4 } from './math.js';
-import { SEC } from '../dat/tree.js';
+import { SEC, datKey } from '../dat/tree.js';
 import { LinkedDataType } from './types.js';
 import { EffectManager, ZoneAssociation, WeatherAssociation } from './effects.js';
 import { ParticleGenerator } from './runtime.js';
@@ -35,6 +35,40 @@ class NoMeshProvider {
 }
 
 const NO_MESH = new NoMeshProvider();
+
+/**
+ * Slash-joined directory ids from the DAT root down to `dir` ("f_qu/weat/thdr"),
+ * matching the path the zone loader records for each 0x2E section. The tree root
+ * carries an empty id and is skipped.
+ */
+function dirPath(dir) {
+  const parts = [];
+  for (let d = dir; d; d = d.parent) if (d.id) parts.push(d.id);
+  return parts.reverse().join('/');
+}
+
+/**
+ * Emission budget for a directly-registered effect. xim wraps each one in a
+ * single-step routine with `duration = 0`, which becomes the generator's
+ * maxEmitTime, and that zero is load-bearing: a generator with autoRun clear
+ * stops as soon as it has emitted once, while an autoRun generator ignores
+ * maxEmitTime entirely and keeps its own cadence.
+ *
+ * Registering with Infinity instead let the non-autoRun ones run forever.
+ * Qufim's thunder spawner `thd2` (11 frames per emission, autoRun clear) is
+ * meant to fire a single bolt on entry; unbounded it fired every 0.37s and each
+ * one spawned a child lightning generator.
+ */
+const SINGLETON_EMIT_TIME = 0;
+
+/** Stand-in until the renderer supplies the real view. */
+const NULL_CAMERA = {
+  getPosition: () => new Vec3(),
+  getViewVector: () => new Vec3(0, 0, 1),
+  getBasis: () => ({ left: new Vec3(1, 0, 0), up: new Vec3(0, 1, 0), forward: new Vec3(0, 0, 1) }),
+  getFoV: () => Math.PI / 4,
+  toCameraSpace: (v) => v.clone(),
+};
 
 /**
  * A particle-attached sound. xim plays it through AudioManager with a distance
@@ -93,18 +127,35 @@ export class ParticleSystem {
    * @param {Object} [opts.globalRoot] DatDir for ROM/0/0.DAT (shared effects)
    * @param {Map}    [opts.zoneMeshIdToName] 0x2E DatId -> mesh name
    * @param {Map}    [opts.zoneMeshes]       mesh name -> prim[]
+   * @param {Array}  [opts.zoneMeshSections] every 0x2E section: { path, id, name, prims }
    * @param {Object} opts.camera       adapter, see CameraAdapter below
    * @param {Object} opts.environment  EnvironmentManager
    */
-  constructor({ zoneRoot, globalRoot = null, zoneMeshIdToName = new Map(), zoneMeshes = new Map(), camera, environment, onWarn = null }) {
+  constructor({ zoneRoot, globalRoot = null, zoneMeshIdToName = new Map(), zoneMeshes = new Map(), zoneMeshSections = [], camera, environment, onWarn = null }) {
     this.zoneRoot = zoneRoot;
     // xim's rootDirectory is the DAT's first pushed directory (f_qu, …), not a
     // synthetic wrapper — link resolution walks up to exactly that.
     this.areaRoot = zoneRoot?.getSubDirectories()[0] ?? zoneRoot;
     this.globalRoot = globalRoot;
-    this.zoneMeshIdToName = zoneMeshIdToName;
+    // DatIds are four raw bytes and short ones are space-padded ("ka1 "), while
+    // a generator's link is read trimmed ("ka1"). Normalise both sides or every
+    // three-character mesh silently fails to resolve — which is what hid East
+    // Ronfaure's rivers while Qufim's four-character `quf1`/`umw1` worked.
+    this.zoneMeshIdToName = new Map();
+    for (const [id, name] of zoneMeshIdToName) this.zoneMeshIdToName.set(datKey(id), name);
     this.zoneMeshes = zoneMeshes;
-    this.camera = camera;
+    // Same id in several directories is normal (every weather declares `clod`,
+    // `suns`, `moon`), so index by id and pick by directory scope at lookup.
+    this.zoneMeshSections = new Map();   // datKey(id) -> section[]
+    for (const s of zoneMeshSections) {
+      const key = datKey(s.id);
+      const list = this.zoneMeshSections.get(key);
+      if (list) list.push(s); else this.zoneMeshSections.set(key, [s]);
+    }
+    // Never null: sun/moon-attached generators read the camera in their
+    // constructor, so a missing adapter would throw during registration and take
+    // the whole weather set down with it.
+    this.camera = camera ?? NULL_CAMERA;
     this.environment = environment;
     this.effectManager = new EffectManager();
 
@@ -144,7 +195,7 @@ export class ParticleSystem {
       if (!dir) continue;
       for (const effect of dir.collectByTypeRecursive(SEC.EFFECT)) {
         if (!effect.def.autoRun) continue;
-        this.effectManager.register(association, this.createGenerator(effect, association));
+        this.effectManager.register(association, this.createGenerator(effect, association, SINGLETON_EMIT_TIME));
         n++;
       }
     }
@@ -163,7 +214,7 @@ export class ParticleSystem {
     const association = WeatherAssociation(weatherId);
     let n = 0;
     for (const effect of dir.collectByTypeRecursive(SEC.EFFECT)) {
-      this.effectManager.register(association, this.createGenerator(effect, association));
+      this.effectManager.register(association, this.createGenerator(effect, association, SINGLETON_EMIT_TIME));
       n++;
     }
     return n;
@@ -219,7 +270,7 @@ export class ParticleSystem {
     const dir = generator.localDir;
     const resource = link.getOrPut((id) => (
       dir?.searchLocalAndParents(id, SEC.PARTICLE_MESH)
-      ?? this.#zoneMeshById(id)
+      ?? this.#zoneMeshById(id, dir)
       ?? dir?.root().getChildRecursive(id, SEC.PARTICLE_MESH)
       ?? this.globalRoot?.getChildRecursive(id, SEC.PARTICLE_MESH)
       ?? null
@@ -245,12 +296,43 @@ export class ParticleSystem {
    * they're bridged in by DatId here. This is what lets `t001 -> quf1` find
    * Qufim's ocean plane.
    */
-  #zoneMeshById(id) {
-    const name = this.zoneMeshIdToName.get(id) ?? this.zoneMeshIdToName.get(id.trim());
+  #zoneMeshById(id, dir = null) {
+    const key = datKey(id);
+    const sections = this.zoneMeshSections.get(key);
+    if (sections?.length) {
+      const section = sections.length === 1 ? sections[0] : this.#nearestSection(sections, dir);
+      // Memoised so the draw-time mesh cache, which is keyed on the resource
+      // object, still hits across frames.
+      section._resource ??= {
+        kind: 'zoneMesh', id, name: section.name, meshes: section.prims.map(primToMesh),
+      };
+      return section._resource;
+    }
+    // Older path: the id -> name -> geometry maps, which keep one entry per id.
+    const name = this.zoneMeshIdToName.get(key);
     if (!name) return null;
     const prims = this.zoneMeshes.get(name);
     if (!prims?.length) return null;
     return { kind: 'zoneMesh', id, name, meshes: prims.map(primToMesh) };
+  }
+
+  /**
+   * Of several sections sharing an id, the one declared closest to the generator
+   * asking for it: same directory first, then the nearest ancestor. Thunder's
+   * `clod` must find weat/thdr's storm layer, not weat/mist's fog layer.
+   */
+  #nearestSection(sections, dir) {
+    if (!dir) return sections[0];
+    const path = dirPath(dir);
+    let best = null;
+    let bestLen = -1;
+    for (const s of sections) {
+      // s.path is the generator's directory or one of its ancestors when it is a
+      // prefix; the longest such prefix is the innermost scope.
+      if (path !== s.path && !path.startsWith(s.path + '/')) continue;
+      if (s.path.length > bestLen) { best = s; bestLen = s.path.length; }
+    }
+    return best ?? sections[0];
   }
 
   #resolveSpriteSheet(link, generator) {

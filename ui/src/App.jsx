@@ -157,6 +157,7 @@ export default function App() {
   const [showUnlit, setShowUnlit] = useState(false);
   const [zoneBrightness, setZoneBrightness] = useState(0); // 0 = zone default, 1 = unlit
   const [showCollision, setShowCollision] = useState(false);
+  const [showEffects, setShowEffects] = useState(true);
   const [showNavmesh, setShowNavmesh] = useState(false);
   const [showSkybox, setShowSkyboxState] = useState(() => localStorage.getItem('skybox') === '1');
   // Persisted skybox preference — kept across zone switches and sessions.
@@ -176,6 +177,11 @@ export default function App() {
   const zoneEnvManagerRef = useRef(null);                   // EnvironmentManager (clock + weather fades)
   const globalEffectsRef = useRef(null);                    // ROM/0/0.DAT shared effects tree
   const weatherAudioRef = useRef(null);                     // ambient weather bed (0x3D sound pointers)
+  const zoneMusicRef = useRef(null);                        // zone_music.json (server zone_settings)
+  const zoneMusicIdRef = useRef(null);                      // zone id of the loaded zone
+  const [zoneTrack, setZoneTrackState] = useState(null);    // resolved BGM for this zone + time
+  const zoneTrackRef = useRef(null);
+  const setZoneTrack = useCallback((t) => { zoneTrackRef.current = t; setZoneTrackState(t); }, []);
   const [weatherList, setWeatherList] = useState([]);       // weather ids present in the zone
   const [weather, setWeather] = useState('');
   const [timeMinutes, setTimeMinutes] = useState(12 * 60);
@@ -184,6 +190,11 @@ export default function App() {
   const [loading, setLoading] = useState(null); // { title, detail } | null
 
   const player = useAudioPlayer();
+  // useAudioPlayer returns a fresh object literal every render, so it must never
+  // appear in a dependency array — doing so gives every dependent callback a new
+  // identity each render and the effects that depend on them loop forever.
+  const playerRef = useRef(player);
+  playerRef.current = player;
 
   const beginLoad = useCallback((title, detail = '') => {
     setLoading({ title, detail });
@@ -203,6 +214,7 @@ export default function App() {
     const renderer = new Renderer(canvasRef.current);
     renderer.screenOffsetX = explorerOpen ? 180 : 0;
     rendererRef.current = renderer;
+    renderer.setFogOverride({ enabled: fogOn, scale: fogScale });
     // Restore View > Toggle WASD from last session.
     if (wasdRef.current) renderer.camera.setMode('fly');
 
@@ -583,11 +595,13 @@ export default function App() {
    */
   const buildParticleSystem = useCallback(async (treeBuf, parsed, environment, gamePath) => {
     const warnings = [];
-    const parsers = makeParsers({
+    const effectParser = {
       [SEC.EFFECT]: (b, d, s, e) => parseParticleGenerator(b, d, s, e, (m) => warnings.push(m)),
-    });
+    };
+    const zoneParsers = makeParsers(effectParser, true);
+    const globalParsers = makeParsers(effectParser, false);
 
-    const treeOf = (buffer) => {
+    const treeOf = (buffer, parsers) => {
       const bytes = new Uint8Array(buffer);
       const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
       return buildDatTree(bytes, dv, parseSections(dv), parsers, (m) => warnings.push(m));
@@ -596,7 +610,7 @@ export default function App() {
     if (!globalEffectsRef.current) {
       try {
         const buf = await backend.readFile(`${gamePath}\\ROM\\0\\0.DAT`);
-        globalEffectsRef.current = { root: treeOf(buf), textures: parseDatTextures(buf) };
+        globalEffectsRef.current = { root: treeOf(buf, globalParsers), textures: parseDatTextures(buf) };
       } catch (e) {
         console.warn('shared effects DAT (ROM/0/0.DAT) unavailable', e);
         globalEffectsRef.current = { root: null, textures: new Map() };
@@ -604,10 +618,11 @@ export default function App() {
     }
 
     const system = new ParticleSystem({
-      zoneRoot: treeOf(treeBuf),
+      zoneRoot: treeOf(treeBuf, zoneParsers),
       globalRoot: globalEffectsRef.current.root,
       zoneMeshIdToName: parsed.meshIdToName,
       zoneMeshes: parsed.meshes,
+      zoneMeshSections: parsed.meshSections,
       camera: null,                 // supplied by renderer.setParticleSystem
       environment,
       onWarn: (m) => console.debug('[particles]', m),
@@ -617,6 +632,53 @@ export default function App() {
     if (warnings.length) console.debug(`[particles] ${warnings.length} parse warnings`);
     console.debug(`[particles] registered ${zoneCount} zone effects`);
     return system;
+  }, []);
+
+  /**
+   * Zone BGM from the server's zone_settings (see dev/bake-zone-music.mjs).
+   * Each zone names a day and a night track; id 0 means genuine silence, which
+   * is why Valkurm Dunes and Qufim Island have no daytime music.
+   *
+   * Resolving is cheap and happens on zone load / time change; *decoding* is not
+   * (ATRAC3 shells out to vgmstream), so playback is left to an explicit press
+   * of the play button rather than firing automatically on every zone load.
+   */
+  const resolveZoneTrack = useCallback(async (zoneId, isNight) => {
+    if (zoneId == null) { setZoneTrack(null); return; }
+    if (!zoneMusicRef.current) {
+      try {
+        const res = await fetch('lists/zone_music.json');
+        zoneMusicRef.current = res.ok ? await res.json() : {};
+      } catch { zoneMusicRef.current = {}; }
+    }
+    const entry = zoneMusicRef.current[String(zoneId)];
+    const track = isNight ? (entry?.night ?? entry?.day) : (entry?.day ?? entry?.night);
+    setZoneTrack(track?.root ? { ...track, isNight } : null);
+  }, []);
+
+  /** Play (or stop) the resolved zone track. */
+  const toggleZoneMusic = useCallback(async () => {
+    const p = playerRef.current;
+    const track = zoneTrackRef.current;
+    if (!p) return;
+    if (!track) { p.stop(); return; }
+
+    const path = `${settingsRef.current?.gamePath}\\${track.root}\\win\\music\\data\\${track.file}`;
+    if (p.current?.path === path && p.playing) { p.pause(); return; }
+    if (p.current?.path === path) { p.resume(); return; }
+
+    try {
+      await p.play({
+        file: track.file,
+        path,
+        root: track.root,
+        num: String(track.id),
+        name: track.name ?? `music${String(track.id).padStart(3, '0')}`,
+      });
+    } catch (e) {
+      console.warn('zone music failed', e);
+      setStatusText(`Zone music failed: ${e.message ?? e}`);
+    }
   }, []);
 
   /**
@@ -639,12 +701,16 @@ export default function App() {
         const buffer = await backend.readFile(abs);
         const header = parseAudioHeader(buffer);
         const audioCtx = weatherAudioRef.current.getContext();
+        // The loop point is a property of the source file, so it survives
+        // whichever decoder runs. Without it an ambient bed replays its intro
+        // on every cycle and clicks.
+        const loopStart = header?.loopStartSec ?? 0;
         // ATRAC3 needs the native decoder via vgmstream; ADPCM/PCM decode here.
         if (header?.sampleFormat === FMT_ATRAC3) {
           const wav = await backend.decodeVgmstream(abs);
-          return audioCtx.decodeAudioData(wav);
+          return { buffer: await audioCtx.decodeAudioData(wav), loopStart };
         }
-        return toAudioBuffer(audioCtx, buffer).audioBuffer;
+        return { buffer: toAudioBuffer(audioCtx, buffer).audioBuffer, loopStart };
       },
     });
     return weatherAudioRef.current;
@@ -709,10 +775,9 @@ export default function App() {
       let particleSystem = null;
       try {
         particleSystem = await buildParticleSystem(treeBuf, parsed, environment, gamePath);
-        if (environment) {
-          environment.particleSystem = particleSystem;
-          environment.activateInitialWeather();
-        }
+        if (environment) environment.particleSystem = particleSystem;
+        // The weather set is activated after the renderer attaches its camera —
+        // sun/moon generators read the camera as they're constructed.
       } catch (e) { console.warn('particle system init failed', e); }
       if (!stillCurrent()) { releaseOverlay(); return; }
       stepLoad('Baking placements…');
@@ -741,15 +806,23 @@ export default function App() {
       renderer.setSkyDome(skyDome);
       renderer.skyWeather = weather0;
       renderer.setModel(model);
-      // setModel clears any previous system, so attach after it.
+      // setModel clears any previous system, so attach after it. Attaching also
+      // installs the camera adapter, which the weather generators need.
       renderer.setParticleSystem(particleSystem, environment);
+      environment?.activateInitialWeather();
       zoneEnvManagerRef.current = environment;
       if (particleSystem && environment) {
         const audio = getWeatherAudio();
         audio.attach(particleSystem, environment);
         audio.setEnabled(localStorage.getItem('weatherAudio') !== '0');
+        audio.setVolume(sfxVolumeRef.current);
         renderer.weatherAudio = audio;
       }
+
+      // Zone BGM. FFXI treats 18:00–06:00 as night for music purposes.
+      zoneMusicIdRef.current = zone.id ?? null;
+      const hour = Math.floor((environment?.getTimeMinutes() ?? time0) / 60);
+      resolveZoneTrack(zone.id, hour < 6 || hour >= 18);
       setSelectedDat(abs.toLowerCase());
       setModelPath(rel);
       sourcePathRef.current = abs;
@@ -837,7 +910,7 @@ export default function App() {
       releaseOverlay();
       if (stillCurrent()) setStatusText(`${displayName} — failed: ${err.message ?? err}`);
     }
-  }, [getKeyTables, beginLoad, stepLoad, endLoad, setWasd, buildParticleSystem, getWeatherAudio]);
+  }, [getKeyTables, beginLoad, stepLoad, endLoad, setWasd, buildParticleSystem, getWeatherAudio, resolveZoneTrack]);
 
   // Character composer (Assets > Characters) — shared by the left panel and
   // the viewbar Action combo.
@@ -1043,8 +1116,47 @@ export default function App() {
     setSettings((s) => (s ? { ...s, bgColor: hex } : s));
   }, []);
 
-  const applyFog = useCallback((opts) => {
-    rendererRef.current.setFog({ ...opts, color: settingsRef.current?.bgColor });
+  // Fog on/off + a distance scale over whatever the scene authored. For zones
+  // that's the 0x2F environment (re-pushed every frame while weather fades), so
+  // these are kept as an override the renderer re-applies rather than a value
+  // the environment can overwrite.
+  const [fogOn, setFogOnState] = useState(() => localStorage.getItem('fogOn') !== '0');
+  const [fogScale, setFogScaleState] = useState(() => {
+    const v = parseFloat(localStorage.getItem('fogScale'));
+    return Number.isFinite(v) && v > 0 ? v : 1;
+  });
+
+  const setFogOn = useCallback((on) => {
+    setFogOnState(on);
+    try { localStorage.setItem('fogOn', on ? '1' : '0'); } catch { /* quota */ }
+    rendererRef.current?.setFogOverride({ enabled: on });
+  }, []);
+
+  const setFogScale = useCallback((scale) => {
+    setFogScaleState(scale);
+    try { localStorage.setItem('fogScale', String(scale)); } catch { /* quota */ }
+    rendererRef.current?.setFogOverride({ scale });
+  }, []);
+
+  // Ambient/weather SFX volume. Kept in a ref as well so a zone loading later
+  // can apply it without waiting for a re-render.
+  const [sfxVolume, setSfxVolumeState] = useState(() => {
+    const v = parseFloat(localStorage.getItem('sfxVolume'));
+    return Number.isFinite(v) ? v : 0.6;
+  });
+  const sfxVolumeRef = useRef(sfxVolume);
+  const setSfxVolume = useCallback((v) => {
+    sfxVolumeRef.current = v;
+    setSfxVolumeState(v);
+    try { localStorage.setItem('sfxVolume', String(v)); } catch { /* quota */ }
+    weatherAudioRef.current?.setVolume(v);
+  }, []);
+
+  const [sfxOn, setSfxOnState] = useState(() => localStorage.getItem('weatherAudio') !== '0');
+  const toggleSfx = useCallback((on) => {
+    setSfxOnState(on);
+    try { localStorage.setItem('weatherAudio', on ? '1' : '0'); } catch { /* quota */ }
+    weatherAudioRef.current?.setEnabled(on);
   }, []);
 
   const saveSettings = async (draft) => {
@@ -1177,6 +1289,16 @@ export default function App() {
           return next;
         });
         break;
+      // Particle effects on/off — water, spray, clouds, sun/moon, lights. Handy
+      // for telling at a glance whether an artefact comes from the effect
+      // runtime or from the zone's own geometry.
+      case 'toggle-effects':
+        setShowEffects((v) => {
+          const next = !v;
+          if (rendererRef.current) rendererRef.current.showEffects = next;
+          return next;
+        });
+        break;
       case 'toggle-navmesh':
         setShowNavmesh((v) => {
           const next = !v;
@@ -1238,6 +1360,9 @@ export default function App() {
       if (env) {
         if (tm !== env.getTimeMinutes()) env.setTimeMinutes(tm);
         env.switchWeather(w);
+        // Day/night BGM follows the clock (FFXI flips at 06:00 and 18:00).
+        const hour = Math.floor(tm / 60);
+        resolveZoneTrack(zoneMusicIdRef.current, hour < 6 || hour >= 18);
         renderer.skyWeather = env.getWeather();
         // The per-frame update pushes lighting from here on; set it once now so
         // a paused scene reflects the change immediately.
@@ -1252,7 +1377,7 @@ export default function App() {
       renderer.setSkyDome(skyDomeFromEnv(resolved));
       renderer.skyWeather = w;
     } catch (e) { console.warn('weather apply failed', e); }
-  }, []);
+  }, [resolveZoneTrack]);
 
   const focusPlacementGroup = useCallback((group) => {
     if (!group?.instances?.length) return;
@@ -1328,6 +1453,7 @@ export default function App() {
           collision: showCollision,
           navmesh: showNavmesh,
           skybox: showSkybox,
+          effects: showEffects,
           noCollision: !hasCollision,
           noNavmesh: !hasNavmesh,
           noSkybox: !hasSkybox,
@@ -1372,7 +1498,6 @@ export default function App() {
           onBg={setBg}
           onFloor={loadFloor}
           onClearFloor={clearFloor}
-          onFog={applyFog}
           onError={(msg) => setStatusText(msg)}
         />
       )}
@@ -1384,7 +1509,9 @@ export default function App() {
         />
       )}
 
-      {leftView === 'zones' && !player.current && (
+      {/* Stays visible while zone music plays — the play button lives in here,
+          so taking the panel over would pull the controls out from under it. */}
+      {leftView === 'zones' && (
         <WeatherPanel
           weathers={weatherList}
           weather={weather}
@@ -1398,10 +1525,26 @@ export default function App() {
           onBg={setBg}
           brightness={zoneBrightness}
           onBrightness={setZoneBrightness}
+          fogOn={fogOn}
+          onFogOn={setFogOn}
+          fogScale={fogScale}
+          onFogScale={setFogScale}
+          musicVolume={player.volume}
+          onMusicVolume={player.setVolume}
+          sfxVolume={sfxVolume}
+          onSfxVolume={setSfxVolume}
+          sfxOn={sfxOn}
+          onToggleSfx={toggleSfx}
+          zoneTrack={zoneTrack}
+          zoneTrackPlaying={
+            !!zoneTrack && player.playing
+            && player.current?.file === zoneTrack.file && player.current?.root === zoneTrack.root
+          }
+          onToggleZoneMusic={toggleZoneMusic}
         />
       )}
 
-      {objectGroups && plcOpen && !player.current && (
+      {objectGroups && plcOpen && (leftView === 'zones' || !player.current) && (
         <PlacementPanel
           groups={objectGroups}
           selectedKey={plcSelected}
@@ -1412,7 +1555,7 @@ export default function App() {
         />
       )}
 
-      {player.current && <MusicPlayer player={player} />}
+      {player.current && leftView !== 'zones' && <MusicPlayer player={player} />}
 
       {!player.current && leftView !== 'zones' && leftView !== 'scene' && (
         <div id="viewbar" className="panel">

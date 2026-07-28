@@ -250,17 +250,22 @@ export function useAudioPlayer() {
       }
       const audioBuffer = await ctx.decodeAudioData(wav);
       bufferRef.current = audioBuffer;
-      loopRef.current = { looped: header.looped, loopStartSec: 0 };
+      // The loop point comes from the .bgw header, not the decoder, so it
+      // applies to the vgmstream output too.
+      const loopStartSec = header.loopStartSec;
+      loopRef.current = { looped: header.looped, loopStartSec };
       setInfo({ formatName: 'ATRAC3', sampleRate: header.sampleRate || audioBuffer.sampleRate,
         channels: audioBuffer.numberOfChannels, durationSec: audioBuffer.duration,
-        looped: header.looped, loopStartSec: 0 });
+        looped: header.looped, loopStartSec });
       startFrom(0);
       return;
     }
 
     const { header: h, audioBuffer } = toAudioBuffer(ctx, buffer);
     bufferRef.current = audioBuffer;
-    const loopStartSec = h.looped ? (h.loopStart * h.blockSamples) / (h.sampleRate || 44100) : 0;
+    // loopStartSec handles the ADPCM-blocks / PCM-frames difference and rejects
+    // out-of-range values; the open-coded blocks formula got both wrong.
+    const loopStartSec = h.loopStartSec;
     loopRef.current = { looped: h.looped, loopStartSec };
     setInfo({
       formatName: h.formatName,

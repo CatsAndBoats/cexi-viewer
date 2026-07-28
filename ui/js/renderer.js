@@ -416,7 +416,11 @@ export class Renderer {
     this.floor = null;      // { texture } when a floor is loaded
     this.floorY = 0;
     this.floorTile = 0.5;
-    this.fog = { enabled: false, color: [0x30 / 255, 0x34 / 255, 0x38 / 255], near: 6, far: 40 };
+    // `_fogBase` is the authored fog (zone environment or manual); `fog` is what
+    // the shaders read after the user's toggle and distance scale are applied.
+    this._fogBase = { enabled: false, color: [0x30 / 255, 0x34 / 255, 0x38 / 255], near: 6, far: 40 };
+    this.fogOverride = { enabled: true, scale: 1 };
+    this.fog = { ...this._fogBase };
 
     // Collision / navmesh debug overlays (zone only).
     this.overlayProgram = buildProgram(gl, OVERLAY_VERTEX_SHADER, OVERLAY_FRAGMENT_SHADER);
@@ -492,15 +496,41 @@ export class Renderer {
     }
   }
 
-  /** { enabled, color:'#rrggbb', near, far } — any subset. */
+  /**
+   * Scene fog, { enabled, color:'#rrggbb', near, far } — any subset.
+   *
+   * The values given here are the *source* fog: for a zone that's whatever the
+   * 0x2F environment authored (re-pushed every frame during a weather fade), for
+   * an entity it's the manual viewer fog. The user's toggle and distance scale
+   * are stored separately and re-applied on top, so an incoming environment
+   * update can't stomp them.
+   */
   setFog(opts = {}) {
-    if (opts.enabled !== undefined) this.fog.enabled = opts.enabled;
+    const base = this._fogBase;
+    if (opts.enabled !== undefined) base.enabled = opts.enabled;
     if (opts.color) {
-      if (Array.isArray(opts.color)) this.fog.color = opts.color;
-      else { const rgb = hexToRgb(opts.color); if (rgb) this.fog.color = rgb; }
+      if (Array.isArray(opts.color)) base.color = opts.color;
+      else { const rgb = hexToRgb(opts.color); if (rgb) base.color = rgb; }
     }
-    if (opts.near !== undefined) this.fog.near = opts.near;
-    if (opts.far !== undefined) this.fog.far = opts.far;
+    if (opts.near !== undefined) base.near = opts.near;
+    if (opts.far !== undefined) base.far = opts.far;
+    this._applyFog();
+  }
+
+  /** User override: { enabled, scale } — scale multiplies the authored distance. */
+  setFogOverride({ enabled, scale } = {}) {
+    if (enabled !== undefined) this.fogOverride.enabled = enabled;
+    if (scale !== undefined) this.fogOverride.scale = scale;
+    this._applyFog();
+  }
+
+  _applyFog() {
+    const base = this._fogBase;
+    const scale = this.fogOverride.scale ?? 1;
+    this.fog.enabled = base.enabled && this.fogOverride.enabled !== false;
+    this.fog.color = base.color;
+    this.fog.near = base.near * scale;
+    this.fog.far = base.far * scale;
   }
 
   /** Apply xim-style terrain lighting (from zone 0x2F environment). */
@@ -582,16 +612,8 @@ export class Renderer {
 
     this.pose = new SkeletonPose(model.skeleton, model.jointOverrides ?? null);
 
-    // Soften PS2 dithered alpha on sky cloud shells.
-    const undither = new Set();
-    if (model.kind === 'zone') {
-      for (const d of model.zoneDraws ?? []) {
-        if (d.layer === 'sky' && !d.celestial && d.textureName) undither.add(d.textureName);
-      }
-    }
-
     for (const tex of model.textures.values()) {
-      const t = this.createTexture(tex, { unditherAlpha: undither.has(tex.name) });
+      const t = this.createTexture(tex);
       if (t) this.textures.set(tex.name, t);
     }
 
@@ -1038,13 +1060,22 @@ export class Renderer {
     gl.disable(gl.BLEND);
 
     const aspect = this.canvas.width / this.canvas.height;
-    let viewProj = mat4Multiply(this.camera.projectionMatrix(aspect), this.camera.viewMatrix());
+    // The Explorer panel overlays the left of the canvas, so the scene is nudged
+    // right in NDC to stay centred in the visible area. The shift is folded into
+    // the projection rather than the combined view-projection so that *every*
+    // pass shares it — a pass that rebuilds its own projection (the particle
+    // drawer needs proj and view separately) would otherwise draw its geometry
+    // offset from the world. Because the offset is in NDC, the resulting
+    // mismatch grows with depth, which reads on screen as parallax.
+    let proj = this.camera.projectionMatrix(aspect);
     if (this.screenOffsetX) {
       const dpr = window.devicePixelRatio || 1;
-      const dx = (2 * this.screenOffsetX * dpr) / this.canvas.width;   // NDC shift
+      const dx = (2 * this.screenOffsetX * dpr) / this.canvas.width;
       const shift = new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, dx, 0, 0, 1]);
-      viewProj = mat4Multiply(shift, viewProj);
+      proj = mat4Multiply(shift, proj);
     }
+    this.projMatrix = proj;
+    const viewProj = mat4Multiply(proj, this.camera.viewMatrix());
     const eye = this.camera.eye;
     const fogFar = this.fog.enabled ? this.fog.far : -1;
 
@@ -1067,12 +1098,11 @@ export class Renderer {
 
     // Zones take the dedicated ordered path (xim ZoneDrawer.drawZoneObjects).
     if (this.model?.kind === 'zone') {
-      if (this.showSkybox) {
-        this._drawSky(viewProj, eye);
-        this._drawSkyMeshes(viewProj, eye);
-      }
+      // Sky is the 0x2F gradient dome plus particles (clouds, sun, moon, stars),
+      // exactly as xim does it — there is no separate textured sky-shell pass.
+      if (this.showSkybox) this._drawSky(viewProj, eye);
       this._drawZone(viewProj, eye, fogFar);
-      this._drawParticles(aspect);
+      this._drawParticles();
       this._drawOverlay(viewProj, this.showCollision ? this.collisionOverlay : null, this.collisionOpacity);
       this._drawOverlay(viewProj, this.showNavmesh ? this.navmeshOverlay : null, this.navmeshOpacity);
       gl.depthMask(true);
@@ -1240,11 +1270,8 @@ export class Renderer {
     let curBlend = null, curCull = null, curBias = null, curDiscard = null, curWind = null, curTex = null;
 
     for (const batch of this.zoneBatches) {
-      // Sky cloud/celestial shells are camera-centred and drawn in their own
-      // pass (_drawSkyMeshes), gated by the skybox toggle. Everything else here
-      // is real world geometry; 0x05 effect meshes are drawn by the particle
-      // system afterwards, not from this list.
-      if (batch.layer === 'sky') continue;
+      // Everything here is placed world geometry; sky shells and 0x05 effect
+      // meshes are drawn by the particle system, not from this list.
 
       // Alpha toggled off in the viewer: draw blend submeshes as solids.
       const blend = alphaOn && batch.blend;
@@ -1332,12 +1359,20 @@ export class Renderer {
         const f = self.camera.forward;
         return toDat(new Vec3(f[0], f[1], f[2])).normalizeInPlace();
       },
+      /**
+       * xim reads the camera basis straight off the view matrix rows
+       * (lookAtLeft / lookAtUp / lookAtForward). Note "forward" there is the
+       * look-at *direction* vector, which points from the target back toward the
+       * eye — deriving these from the true forward vector instead flips X and Z
+       * and throws camera-attached effects to the wrong side of the viewer.
+       */
       getBasis() {
-        const f = self.camera.forward;
-        const forward = toDat(new Vec3(f[0], f[1], f[2])).normalizeInPlace();
-        const left = new Vec3(0, 1, 0).cross(forward).normalizeInPlace();
-        const up = forward.cross(left).normalizeInPlace();
-        return { left, up, forward };
+        const m = self.camera.viewMatrix();
+        return {
+          left: toDat(new Vec3(m[0], m[4], m[8])),
+          up: toDat(new Vec3(m[1], m[5], m[9])),
+          forward: toDat(new Vec3(m[2], m[6], m[10])),
+        };
       },
       getFoV: () => self.camera.fov ?? (Math.PI / 4),
       toCameraSpace(v) {
@@ -1364,9 +1399,17 @@ export class Renderer {
     const env = this.particleEnvironment;
     if (env) {
       env.update(elapsedFrames, { advanceClock: this.advanceGameClock === true });
-      if (env.weatherTransition) {
+
+      // xim SkyBoxMesh.isExpired: the dome is rebuilt when the clock has moved
+      // more than a game-minute, and continuously while weather cross-fades.
+      // Without the time check the sky and its lighting stay frozen at whatever
+      // hour the zone loaded at.
+      const tod = env.clock.currentTimeOfDayInSeconds();
+      const stale = this._skyBuiltAt == null || tod < this._skyBuiltAt || tod > this._skyBuiltAt + 60;
+      if (env.weatherTransition || stale) {
         this.setTerrainLighting(env.getTerrainLighting());
         this.setSkyDome(env.getSkyDome());
+        this._skyBuiltAt = tod;
       }
     }
 
@@ -1374,16 +1417,19 @@ export class Renderer {
     this.weatherAudio?.update();
   }
 
-  _drawParticles(aspect) {
+  _drawParticles() {
+    // Not gated on showSkybox: water, spray and fountains are world effects, and
+    // hiding the sky shouldn't drain the sea. View > Toggle Effects hides them.
     const system = this.particleSystem;
-    if (!system || !this.showSkybox) return;
+    if (!system || this.showEffects === false) return;
     if (!this.particleDrawer) this.particleDrawer = new ParticleDrawer(this.gl);
-    this.particleDrawer.setTextures(this.textures, this.whiteTexture);
+    this.particleDrawer.setTextures(this.textures);
 
     this.particleDrawer.draw({
       system,
       view: this.camera.viewMatrix(),
-      proj: this.camera.projectionMatrix(aspect),
+      // Must be the same projection the zone pass used, Explorer offset and all.
+      proj: this.projMatrix,
       lighting: this._zoneLightUniforms(),
       fog: this.fog,
       showTextures: this.showTextures,
@@ -1419,94 +1465,6 @@ export class Renderer {
     gl.bindVertexArray(null);
     gl.enable(gl.DEPTH_TEST);
     gl.depthMask(true);
-  }
-
-  /**
-   * Textured sky shells (xim celestial/cloud meshes): the weather-matched cloud
-   * layer (`clod_a01`, `suny_a01`, `cld_fine_a01`, …) plus always-on celestials
-   * (`sunsphere`/`moonsphere`/`star`). They're authored unplaced at a small
-   * radius, so we centre them on the camera and draw them like the dome —
-   * behind the world (depth-test off), textured and alpha-blended, over the
-   * gradient dome. Uses the zone shader for texturing/lighting/fog.
-   */
-  _drawSkyMeshes(viewProj, eye) {
-    const gl = this.gl;
-    const sky = this.zoneBatches.filter((b) => b.layer === 'sky' && !b.positioned
-      && (b.celestial || b.weather == null || b.weather === this.skyWeather));
-    if (sky.length === 0) return;
-    const clouds = sky.filter((b) => !b.celestial);
-    const celestial = sky.filter((b) => b.celestial);
-
-    gl.useProgram(this.zoneProgram);
-    gl.uniformMatrix4fv(this.zoneUniforms.viewProj, false, viewProj);
-    gl.uniform1i(this.zoneUniforms.texture, 0);
-    gl.uniform3fv(this.zoneUniforms.cameraPos, eye);
-    gl.uniform2f(this.zoneUniforms.fogRange, 0, -1);           // no fog on the sky
-    gl.uniform3fv(this.zoneUniforms.center, eye);              // follow the camera
-    gl.uniform1f(this.zoneUniforms.wind, 0);
-    gl.uniform1f(this.zoneUniforms.showAlpha, this.showAlpha ? 1 : 0);
-    gl.uniform1f(this.zoneUniforms.discard, 0);
-    gl.uniform2f(this.zoneUniforms.uvOffset, 0, 0);
-
-    gl.disable(gl.DEPTH_TEST);   // behind the world; painted over by terrain next
-    gl.depthMask(false);
-    gl.disable(gl.CULL_FACE);
-    gl.enable(gl.BLEND);
-    gl.activeTexture(gl.TEXTURE0);
-
-    const drawList = (list, uvOfs = [0, 0]) => {
-      gl.uniform2f(this.zoneUniforms.uvOffset, uvOfs[0], uvOfs[1]);
-      for (const batch of list) {
-        gl.bindTexture(gl.TEXTURE_2D, this.showTextures && batch.texture ? batch.texture : this.whiteTexture);
-        gl.bindVertexArray(batch.vao);
-        gl.drawArrays(gl.TRIANGLES, 0, batch.count);
-      }
-    };
-
-    // Celestial bodies (sun / moon / stars) are emissive sprites on a black
-    // field: additive blend (black adds nothing → invisible by day) and unlit
-    // (ambient forced white, no directional) so they aren't shaded to dark
-    // triangles. Drawn first, behind the clouds.
-    if (celestial.length) {
-      gl.uniform3fv(this.zoneUniforms.ambient, [1, 1, 1]);
-      gl.uniform3fv(this.zoneUniforms.sunColor, [0, 0, 0]);
-      gl.uniform3fv(this.zoneUniforms.moonColor, [0, 0, 0]);
-      gl.blendFunc(gl.ONE, gl.ONE);
-      drawList(celestial, [0, 0]);
-    }
-
-    // Cloud layer: normal alpha blend, lit by the environment.
-    // UV drift from 0x05 cloud generators (~0.0001–0.0007 / tick @ 30fps).
-    // Multi-layer shells get staggered speeds so parallax reads as depth.
-    if (clouds.length) {
-      const L = this._zoneLightUniforms();
-      gl.uniform3fv(this.zoneUniforms.ambient, L.ambient);
-      gl.uniform3fv(this.zoneUniforms.sunDir, L.sunDir);
-      gl.uniform3fv(this.zoneUniforms.sunColor, L.sunColor);
-      gl.uniform3fv(this.zoneUniforms.moonDir, L.moonDir);
-      gl.uniform3fv(this.zoneUniforms.moonColor, L.moonColor);
-      gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
-      const t = (typeof performance !== 'undefined' ? performance.now() : Date.now()) * 0.001;
-      // Per-tick rates × 30fps; two layers for multi-shell weathers.
-      const rates = [
-        [0.00025 * 30, 0.00004 * 30],
-        [0.00012 * 30, -0.00003 * 30],
-        [0.00035 * 30, 0.00002 * 30],
-      ];
-      clouds.forEach((batch, i) => {
-        const r = rates[i % rates.length];
-        const scroll = batch.uvScroll;
-        const sx = scroll ? scroll[0] * 30 : r[0];
-        const sy = scroll ? scroll[1] * 30 : r[1];
-        drawList([batch], [sx * t, sy * t]);
-      });
-    }
-
-    gl.uniform2f(this.zoneUniforms.uvOffset, 0, 0);
-    gl.bindVertexArray(null);
-    gl.enable(gl.DEPTH_TEST);
-    gl.depthMask(true);
-    gl.disable(gl.BLEND);
   }
 
   _drawOverlay(viewProj, overlay, opacity) {

@@ -542,6 +542,14 @@ export function parseZone(datBuffer, keyTables) {
 
   const meshes = new Map();       // name -> [prim] (first wins; world + fallback)
   const meshIdToName = new Map();  // 0x2E section DatId -> mesh name (for effect-generator links)
+  // Both maps above are lossy on purpose (placements only ever want one mesh per
+  // name), but effect generators need the exact section their own directory
+  // declares: Qufim carries three `clod` sections — weat/thdr, weat/clod and
+  // weat/mist — sharing the mesh name `clod_a01` but with different textures.
+  // Collapsing them makes every weather draw one zone's clouds, which is why
+  // switching weather appeared to change nothing. Keep them all, with the
+  // directory path, and let the particle system resolve by scope.
+  const meshSections = [];        // { path, id, name, prims }
   // Per-weather sky shells under weat/<id>/ — same mesh name can appear in many
   // weather folders with different textures (clod_a01 × clod/mist/thdr/…).
   // First-wins on `meshes` would keep only one and hide clouds for other weathers.
@@ -556,6 +564,7 @@ export function parseZone(datBuffer, keyTables) {
     const { meshName, prims } = parseZoneMeshSection(bytes, dv, s);
     if (meshName) meshIdToName.set(s.id, meshName);
     if (!prims.length || !meshName) continue;
+    meshSections.push({ path: stack.join('/'), id: s.id, name: meshName, prims });
 
     const dirWeather = stack.includes('weat')
       ? [...stack].reverse().find((id) => WEATHER_DIR_IDS.has(id)) || null
@@ -620,7 +629,7 @@ export function parseZone(datBuffer, keyTables) {
   }
 
   return {
-    meshes, placements, textures, meshIdToName,
+    meshes, placements, textures, meshIdToName, meshSections,
     collision, interactions, subAreas, weatherSky,
   };
 }

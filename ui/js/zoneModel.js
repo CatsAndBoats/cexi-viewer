@@ -57,32 +57,6 @@ function toDisplay(x, y, z) {
   return [-x, -y, z];
 }
 
-// Classify a sky-shell mesh: weather from the DAT weat/<id>/ folder when known,
-// else from the mesh name (clod_a01 / cld_fine_a01 / …). Celestials always on.
-// Celestial checks run BEFORE weather substring match so "stardust" isn't "dust".
-const SKY_WEATHER_IDS = ['fine', 'suny', 'clod', 'mist', 'dryw', 'heat', 'rain', 'squl',
-  'dust', 'sand', 'wind', 'stom', 'snow', 'bliz', 'thdr', 'bolt', 'aura', 'ligt', 'fogd', 'dark'];
-function isCelestialName(n) {
-  // suny_* is sunshine-weather clouds, not the sun body (sun/sunsphere).
-  if (n.startsWith('suny')) return false;
-  if (n.includes('sphere')) return true;
-  return n.startsWith('sun') || n.startsWith('moon') || n.startsWith('star');
-}
-
-function skyClassOf(name, dirWeather = null) {
-  const n = (name || '').toLowerCase();
-  // Sun/moon discs are small meshes meant to sit far away at the sun/moon
-  // *direction* (a pole vertex at the local origin), not wrapped on the camera.
-  // Flag them 'positioned' so the renderer can skip them until placed properly
-  // — otherwise camera-centring drags that pole to the eye (screen-wide wedge).
-  if (isCelestialName(n)) {
-    return { weather: null, celestial: true, positioned: n.includes('sphere') };
-  }
-  if (dirWeather) return { weather: dirWeather, celestial: false, positioned: false };
-  for (const w of SKY_WEATHER_IDS) if (n.includes(w)) return { weather: w, celestial: false, positioned: false };
-  return { weather: null, celestial: false, positioned: false };   // unknown → always shown
-}
-
 const clamp255 = (v) => Math.max(0, Math.min(255, (v * 255 + 0.5) | 0));
 
 /**
@@ -172,7 +146,7 @@ export function zoneToModel(parsed, sourceName = '', opts = {}) {
   const draws = [];
   let triCount = 0;
 
-  const emitPrim = (meshName, prim, matrix, layer = 'world', dirWeather = null) => {
+  const emitPrim = (meshName, prim, matrix, layer = 'world') => {
     const texKey = resolveTexture(prim.textureName, texMap) || prim.textureName || '';
     const discard = discardThresholdFor(meshName);
     const wind = !!prim.hasBlendPos;
@@ -180,21 +154,14 @@ export function zoneToModel(parsed, sourceName = '', opts = {}) {
     // the transform is baked in; pre-swap so the renderer keeps one fixed
     // front-face convention (xim instead flips frontFace per draw).
     const mirrored = det3(matrix) < 0;
-
-    // Sky shells: weather from weat/<id>/ directory when known, else mesh name.
-    // Celestials always shown; cloud layers only when skyWeather matches.
-    const sky = layer === 'sky' ? skyClassOf(meshName, dirWeather) : null;
     const blend = prim.blend;
 
     const last = draws[draws.length - 1];
     let d = last;
     if (!d || d.layer !== layer || d.texKey !== texKey || d.blend !== blend
-      || d.noCull !== prim.noCull || d.discard !== discard || d.wind !== wind
-      || d.weather !== (sky?.weather ?? null) || d.celestial !== !!sky?.celestial
-      || d.positioned !== !!sky?.positioned) {
+      || d.noCull !== prim.noCull || d.discard !== discard || d.wind !== wind) {
       d = {
         layer, texKey, blend, noCull: prim.noCull, discard, wind,
-        weather: sky?.weather ?? null, celestial: !!sky?.celestial, positioned: !!sky?.positioned,
         positions: [], blendOffsets: [], normals: [], uvs: [], colors: [],
       };
       draws.push(d);
@@ -236,11 +203,6 @@ export function zoneToModel(parsed, sourceName = '', opts = {}) {
     const prims = meshes.get(meshName);
     if (!prims) return;
     for (const prim of prims) emitPrim(meshName, prim, matrix, layer, null);
-  };
-
-  /** Emit a weather-folder sky shell (prims already resolved; not looked up by name). */
-  const emitSkyPrims = (meshName, prims, dirWeather) => {
-    for (const prim of prims) emitPrim(meshName, prim, IDENTITY, 'sky', dirWeather);
   };
 
   const envKindOf = (name) => {
@@ -293,7 +255,9 @@ export function zoneToModel(parsed, sourceName = '', opts = {}) {
     });
   };
 
-  // World geometry: 0x1C placements (skip env shells — they go on the env layer).
+  // World geometry: 0x1C placements. Anything with a real placement is world
+  // geometry and draws in world space, sky-ish name or not — `kind` only
+  // classifies it for the objects panel.
   for (const p of placements) {
     if (!isSanePlacement(p)) { skippedWild++; continue; }
     const resolved = resolveMeshName(p.meshId, meshes);
@@ -301,13 +265,8 @@ export function zoneToModel(parsed, sourceName = '', opts = {}) {
     placedMeshes.add(resolved);
     const kind = envKindOf(resolved);
     const matrix = trsMatrix(p.pos, p.rot, p.scale);
-    if (kind) {
-      emitMesh(resolved, matrix, kind);   // layer = 'sky' | 'water'
-      pushPlacement(p, resolved, matrix, kind);
-    } else {
-      emitMesh(resolved, matrix, 'world');
-      pushPlacement(p, resolved, matrix, null);
-    }
+    emitMesh(resolved, matrix, 'world');
+    pushPlacement(p, resolved, matrix, kind);
   }
 
   // 0x05 effect geometry — water surfaces, spray, godrays, thunder — is no
@@ -318,22 +277,24 @@ export function zoneToModel(parsed, sourceName = '', opts = {}) {
   // heuristics (alpha-0 skips, whiteTexMask, untextured-chroma guards) were
   // compensating for.
 
-  // Weather-folder sky shells (weat/<id>/…): one entry per weather×mesh so each
-  // weather keeps its own cloud texture (mist/clod/thdr all ship clod_a01, etc.).
-  const weatherSky = parsed.weatherSky ?? [];
-  const weatherSkyNames = new Set(weatherSky.map((e) => e.name));
-  for (const entry of weatherSky) {
+  // Sky shells (clouds, sun, moon, stars) are NOT baked here either. In xim the
+  // only thing drawn as "sky" is the procedural gradient dome built from the
+  // 0x2F skybox slices; every cloud layer and celestial body is a 0x05 generator
+  // run by the particle system, which is what places them relative to the camera
+  // and the sun/moon and animates their drift.
+  //
+  // Emitting them here as well drew each layer twice — once wrapped on the
+  // camera and once parked at the world origin — which read as hard-edged quads
+  // slicing through the clouds and a badly over-bright sun.
+  //
+  // They still appear in the objects panel so they stay inspectable.
+  for (const entry of parsed.weatherSky ?? []) {
     if (placedMeshes.has(entry.name)) continue;
-    emitSkyPrims(entry.name, entry.prims, entry.weather);
     const b = meshLocalBounds(entry.prims);
     if (b && !localBounds.has(entry.name)) localBounds.set(entry.name, b);
     const local = localBounds.get(entry.name);
-    const bounds = local ? transformBoundsDisplay(local, IDENTITY) : {
-      min: [-1, -1, -1], max: [1, 1, 1],
-    };
-    const label = entry.weather ? `${entry.name} (${entry.weather})` : entry.name;
     zonePlacements.push({
-      name: label,
+      name: entry.weather ? `${entry.name} (${entry.weather})` : entry.name,
       meshId: entry.name,
       mesh: entry.name,
       index: -1,
@@ -342,35 +303,8 @@ export function zoneToModel(parsed, sourceName = '', opts = {}) {
       rawPos: [0, 0, 0],
       rot: [0, 0, 0],
       scale: [1, 1, 1],
-      bounds,
+      bounds: local ? transformBoundsDisplay(local, IDENTITY) : { min: [-1, -1, -1], max: [1, 1, 1] },
       kind: 'sky',
-    });
-  }
-
-  // Unplaced sky shells sit at the origin (engine wraps sky around camera). Unplaced
-  // water without a surface effect is a bare template — skip it (it would be a speck).
-  // Skip names already emitted from weatherSky so we don't double-draw.
-  for (const name of meshes.keys()) {
-    if (placedMeshes.has(name) || weatherSkyNames.has(name)) continue;
-    const kind = envKindOf(name);
-    if (kind !== 'sky') continue; // only unplaced sky; other unplaced meshes are VFX junk
-    emitMesh(name, IDENTITY, kind);
-    const local = localBounds.get(name);
-    const bounds = local ? transformBoundsDisplay(local, IDENTITY) : {
-      min: [-1, -1, -1], max: [1, 1, 1],
-    };
-    zonePlacements.push({
-      name,
-      meshId: name,
-      mesh: name,
-      index: -1,
-      instance: 1,
-      pos: [0, 0, 0],
-      rawPos: [0, 0, 0],
-      rot: [0, 0, 0],
-      scale: [1, 1, 1],
-      bounds,
-      kind,
     });
   }
 
@@ -389,11 +323,6 @@ export function zoneToModel(parsed, sourceName = '', opts = {}) {
       noCull: d.noCull,
       discard: d.discard,
       wind: d.wind,
-      weather: d.weather ?? null,
-      celestial: !!d.celestial,
-      positioned: !!d.positioned,
-      surface: d.surface || null,
-      uvScroll: d.uvScroll || null,
       zBias: d.blend ? 5 : 0,
       count: n,
       positions: new Float32Array(d.positions),
