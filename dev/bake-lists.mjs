@@ -16,6 +16,11 @@
 //   sfx.json         SFX folder + effect display names.
 //   floors.json      floor texture list (zone label, DAT spec, fourcc).
 //
+// gear-models.json (DAT -> equipment model id, per race/slot) is generated from
+// FFXiMain.dll + FTABLE via cexi-tools — see dev/gear-models.py. It supplies each
+// item's `mid`, which the look string needs; without it a look can only carry the
+// list row index, i.e. a look for the wrong gear.
+//
 // battle-table.json (weaponAnimationType -> battle DAT, per race) is generated
 // from FFXiMain.dll + FTABLE via cexi-tools:
 //   uv run python -c "from cexi.entity.anim.xi_motion_tables import *; ..."
@@ -72,6 +77,44 @@ const WEAPON_STYLE = {
 };
 
 const battleTable = existsSync(BATTLE) ? JSON.parse(readFileSync(BATTLE, 'utf8')) : {};
+
+// DAT -> equipment model id, per race/slot (dev/gear-models.py, from FFXiMain.dll +
+// FTABLE via cexi-tools). The CSVs carry no model id, but a look string encodes each
+// worn slot as (slotIndex << 12) | modelId — so every item needs its real `mid` or the
+// composer can only emit a row index, which is a look for the WRONG gear.
+const GEAR_MODELS = join(root, 'dev', 'gear-models.json');
+const gearModels = existsSync(GEAR_MODELS) ? JSON.parse(readFileSync(GEAR_MODELS, 'utf8')) : {};
+if (!existsSync(GEAR_MODELS)) {
+  console.warn(`! ${GEAR_MODELS} missing — items will have no model id and look strings `
+    + `will be wrong. Regenerate it with: uv run python dev/gear-models.py (in cexi-tools)`);
+}
+
+/**
+ * Attach each item's real equipment model id (`mid`), keyed by its first DAT path.
+ *
+ * Tarutaru is one viewer race spanning two LOOK races (5 male / 6 female — its "gender" is
+ * only the face), and the two equipment tables give the same armour DAT *different* model
+ * ids. Such races also get `midAlt` (the female table's id), and their face items get the
+ * `lookRace` that DAT belongs to, so the composer can emit a self-consistent look.
+ */
+function attachModelIds(items, raceId, slotKey) {
+  const race = gearModels[raceId];
+  const map = race?.slots?.[slotKey];
+  const alt = race?.slotsAlt?.[slotKey];
+  for (const it of items) {
+    const dat = it.paths?.[0]?.replace(/\\/g, '/').toUpperCase();
+    const mid = dat ? map?.[dat] : undefined;
+    const midAlt = dat && alt ? alt[dat] : undefined;
+    it.mid = mid ?? midAlt ?? 0;    // 0 = the race's naked base part / nothing worn
+    if (midAlt !== undefined && midAlt !== it.mid) it.midAlt = midAlt;
+    if (slotKey === 'face' && alt && dat) {
+      // Faces are disjoint between the two tables, so the DAT alone fixes the look race.
+      it.lookRace = mid !== undefined ? race.lookRace : race.lookRaceAlt;
+    }
+  }
+  return items;
+}
+
 const pcIndex = rd('PC/index.csv');
 if (!pcIndex) { console.error(`no PC/index.csv under ${SRC}`); process.exit(1); }
 
@@ -80,7 +123,7 @@ for (const race of parseRaceIndex(pcIndex)) {
   const slots = {};
   for (const [key, file] of SLOTS) {
     const text = rd(`PC/${race.id}/${file}.csv`);
-    if (text !== null) slots[key] = parseSlotCsv(text);
+    if (text !== null) slots[key] = attachModelIds(parseSlotCsv(text), race.id, key);
   }
 
   const csvActs = parseSlotCsv(rd(`PC/${race.id}/Action.csv`) ?? '');
@@ -109,7 +152,11 @@ for (const race of parseRaceIndex(pcIndex)) {
   });
   actions.push(...csvActs.filter((a) => !(a.group === 'Battle' && a.label === 'Battle')));
 
-  races.push({ id: race.id, label: race.label, base: race.base, motionExtra, battleByType, slots, actions });
+  // lookRace: the look_t race byte for this race (absent for the NPC/mount pseudo-races,
+  // which have no PC equipment tables and so can't produce a look).
+  const lookRace = gearModels[race.id]?.lookRace;
+  races.push({ id: race.id, label: race.label, base: race.base, lookRace,
+               motionExtra, battleByType, slots, actions });
 }
 write('characters.json', { races });
 

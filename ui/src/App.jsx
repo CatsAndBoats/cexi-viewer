@@ -36,6 +36,10 @@ import { parseParticleGenerator } from '../js/particle/parser.js';
 import { ParticleSystem } from '../js/particle/system.js';
 import { WeatherAudio } from '../js/particle/audio.js';
 import { toAudioBuffer, parseAudioHeader, FMT_ATRAC3 } from '../js/audio.js';
+import { parseImageDat, textureForSet } from '../js/images.js';
+import { ImageList } from './ImageList.jsx';
+import { ImageSetPanel } from './ImageSetPanel.jsx';
+import { ImageViewer } from './ImageViewer.jsx';
 import { WeatherPanel } from './WeatherPanel.jsx';
 import { Tooltip } from './Tooltip.jsx';
 import { loadZoneNavmesh } from '../js/navmesh.js';
@@ -45,7 +49,9 @@ const DEFAULT_BG = '#303438';
 const LAST_DAT_KEY = 'lastDat';
 const LAST_VIEW_KEY = 'lastView';
 const ANIM_SEL_KEY = 'lastAnimSel';
-const VIEWS = ['files', 'npc', 'pc', 'music', 'sfx', 'scene', 'zones'];
+const VIEWS = ['files', 'npc', 'pc', 'music', 'sfx', 'scene', 'zones', 'images'];
+/** Views that browse individual models, where fly controls are a hindrance. */
+const ORBIT_VIEWS = new Set(['files', 'npc', 'pc']);
 
 // A schedule sequence lays segments on a timeline; a joint whose segment hasn't
 // started yet would show bind pose (T-pose flash each loop). Underlay a looping
@@ -128,6 +134,13 @@ export default function App() {
     setLeftViewState(v);
     localStorage.setItem(LAST_VIEW_KEY, v);
   }, []);
+  // Browsing single models rather than a zone: fly controls put the camera
+  // somewhere arbitrary and WASD swallows typing in the filter boxes, so drop
+  // back to orbit on arrival. Only fires on a view change, so turning WASD back
+  // on while you are in one of these views sticks.
+  useEffect(() => {
+    if (ORBIT_VIEWS.has(leftView) && wasdRef.current) setWasd(false);
+  }, [leftView, setWasd]);
   // Left explorer panel (zones/files/…); toolbar toggle, persisted.
   const [explorerOpen, setExplorerOpen] = useState(() => localStorage.getItem('explorer') !== '0');
   const [statusText, setStatusText] = useState('');       // secondary detail/stats
@@ -158,6 +171,13 @@ export default function App() {
   const [zoneBrightness, setZoneBrightness] = useState(0); // 0 = zone default, 1 = unlit
   const [showCollision, setShowCollision] = useState(false);
   const [showEffects, setShowEffects] = useState(true);
+  // Camera readouts for the toolbar. Fly speed is mirrored from the camera each
+  // frame; FOV is owned here and pushed down, since nothing else writes it.
+  const [flySpeed, setFlySpeed] = useState(0);
+  const [fov, setFovState] = useState(() => {
+    const saved = Number(localStorage.getItem('fovDegrees'));
+    return Number.isFinite(saved) && saved >= 20 && saved <= 120 ? saved : 45;
+  });
   const [showNavmesh, setShowNavmesh] = useState(false);
   const [showSkybox, setShowSkyboxState] = useState(() => localStorage.getItem('skybox') === '1');
   // Persisted skybox preference — kept across zone switches and sessions.
@@ -215,16 +235,26 @@ export default function App() {
     renderer.screenOffsetX = explorerOpen ? 180 : 0;
     rendererRef.current = renderer;
     renderer.setFogOverride({ enabled: fogOn, scale: fogScale });
+    renderer.camera.fovDegrees = fov;
     // Restore View > Toggle WASD from last session.
     if (wasdRef.current) renderer.camera.setMode('fly');
+    // Seed the toolbar readout so it never shows 0 before the first frame.
+    setFlySpeed(Math.round(renderer.camera.flySpeed));
 
     let raf;
     let last = performance.now();
+    let shownFlySpeed = -1;
     const frame = (now) => {
       const dt = Math.min((now - last) / 1000, 0.1);
       last = now;
       if (wasdRef.current) renderer.camera.flyUpdate(dt, heldKeys.current);
       renderer.render(dt);
+      // The camera owns fly speed and changes it from the wheel, from zone vs
+      // entity range presets and from localStorage, so mirror it here rather
+      // than trying to catch every writer. Only on a change of the rounded
+      // value, so this is a handful of updates, not one per frame.
+      const speed = Math.round(renderer.camera.flySpeed);
+      if (speed !== shownFlySpeed) { shownFlySpeed = speed; setFlySpeed(speed); }
       raf = requestAnimationFrame(frame);
     };
     raf = requestAnimationFrame(frame);
@@ -318,7 +348,7 @@ export default function App() {
    *   keepCamera  — don't re-fit the camera (gear swap on the same actor).
    */
   const loadModel = useCallback(async (paths, displayName, opts = {}) => {
-    const { focusPaths = null, weaponSlots = null, battleTable = null, parts = null, keepCamera = false } = opts;
+    const { focusPaths = null, weaponSlots = null, battleTable = null, parts = null, keepCamera = false, displayPath = null } = opts;
     // Gear swaps (keepCamera) are snappy — skip the full-screen overlay there.
     const showOverlay = !keepCamera;
     const gen = ++loadGenRef.current;
@@ -412,8 +442,9 @@ export default function App() {
       const prevPlay = appliedPlayRef.current;
       modelRef.current = model;
       renderer.setModel(model, keepCamera);
-      setSelectedDat(paths[paths.length - 1].toLowerCase());
-      setModelPath(relativeName(paths[paths.length - 1]));
+      const primaryPath = displayPath ?? paths[paths.length - 1];
+      setSelectedDat(primaryPath.toLowerCase());
+      setModelPath(relativeName(primaryPath));
       sourcePathRef.current = paths[paths.length - 1];
 
       // Viewbar lists. Group over the WHOLE model so each clip's body-region
@@ -570,6 +601,7 @@ export default function App() {
         battleTable: entry.battleTable ?? null,
         parts: entry.parts?.map((p) => ({ ...p, paths: p.paths.map(abs) })) ?? null,
         keepCamera: !!entry.keepCamera,
+        displayPath: entry.displayPath ? abs(entry.displayPath) : null,
       });
     },
     [loadModel]);
@@ -1138,6 +1170,50 @@ export default function App() {
     rendererRef.current?.setFogOverride({ scale });
   }, []);
 
+  // ── Assets > Images ────────────────────────────────────────────────────────
+  const [imageEntry, setImageEntry] = useState(null);   // { name, path }
+  const [imageDoc, setImageDoc] = useState(null);       // parseImageDat result + resolved sets
+  const [imageSet, setImageSet] = useState(null);
+
+  const loadImage = useCallback(async (entry) => {
+    const gamePath = settingsRef.current?.gamePath;
+    if (!gamePath) { setStatusText('Game path not set — open Settings first.'); return; }
+    setImageEntry(entry);
+    setImageSet(null);
+    setImageDoc(null);
+    // Images are 2D and cover the viewport, so anything still in the scene just
+    // shows through. Drop it the way switching to Music does.
+    rendererRef.current?.setModel(null);
+    modelRef.current = null;
+    setModelPath(entry.path);
+    setAnims([]);
+    setCurrentAnim('');
+    try {
+      const buf = await backend.readFile(`${gamePath}\\${entry.path}`);
+      const doc = parseImageDat(buf);
+      if (doc.kind === 'sets') {
+        // Resolve each set's atlas once here so the panel and the viewer agree.
+        doc.sets = doc.sets.map((s) => ({ ...s, texture: textureForSet(s, doc.textures) }));
+      }
+      setImageDoc(doc);
+      const first = doc.kind === 'sets' ? doc.sets.find((s) => s.texture) ?? doc.sets[0] : null;
+      setImageSet(first ?? null);
+      setStatusText(doc.kind === 'png' ? 'PNG' : `${doc.sets?.length ?? 0} image sets`);
+    } catch (e) {
+      setImageDoc({ kind: 'empty' });
+      setStatusText(`Failed to read ${entry.path}: ${e.message ?? e}`);
+    }
+  }, []);
+
+  const setFov = useCallback((deg) => {
+    const v = Math.min(120, Math.max(20, Math.round(deg)));
+    setFovState(v);
+    try { localStorage.setItem('fovDegrees', String(v)); } catch { /* quota */ }
+    // Read fresh every frame by projectionMatrix(), so no redraw call needed.
+    const camera = rendererRef.current?.camera;
+    if (camera) camera.fovDegrees = v;
+  }, []);
+
   // Ambient/weather SFX volume. Kept in a ref as well so a zone loading later
   // can apply it without waiting for a re-render.
   const [sfxVolume, setSfxVolumeState] = useState(() => {
@@ -1330,6 +1406,14 @@ export default function App() {
       case 'assets-zones':
         setLeftView('zones');
         break;
+      case 'assets-images':
+        setLeftView('images');
+        break;
+      case 'open-dat':
+        backend.pickFile(settingsRef.current?.gamePath || null)
+          .then((file) => { if (file) loadFromTree(file); })
+          .catch((err) => setStatusText(`Open DAT failed: ${err.message ?? err}`));
+        break;
       case 'help':
         setHelpOpen(true);
         break;
@@ -1458,6 +1542,9 @@ export default function App() {
           noNavmesh: !hasNavmesh,
           noSkybox: !hasSkybox,
         }}
+        flySpeed={flySpeed}
+        fov={fov}
+        onFov={setFov}
       />
 
       {explorerOpen && leftView === 'files' && (
@@ -1507,6 +1594,26 @@ export default function App() {
           onSelectZone={loadZone}
           onError={(msg) => setStatusText(msg)}
         />
+      )}
+
+      {explorerOpen && leftView === 'images' && (
+        <ImageList
+          selectedPath={imageEntry?.path}
+          onSelectImage={loadImage}
+          onError={(msg) => setStatusText(msg)}
+        />
+      )}
+
+      {leftView === 'images' && imageDoc && (
+        <>
+          <ImageViewer doc={imageDoc} set={imageSet} />
+          <ImageSetPanel
+            file={imageEntry}
+            sets={imageDoc.kind === 'sets' ? imageDoc.sets : []}
+            selected={imageSet}
+            onSelect={setImageSet}
+          />
+        </>
       )}
 
       {/* Stays visible while zone music plays — the play button lives in here,

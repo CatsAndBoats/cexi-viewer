@@ -33,7 +33,7 @@ const MENUS = [
     items: [
       { id: 'assets-files', label: 'File Browser', icon: 'folder_open' },
       { id: 'assets-data', label: 'Data', icon: 'database', disabled: true },
-      { id: 'assets-images', label: 'Images', icon: 'image', disabled: true },
+      { id: 'assets-images', label: 'Images', icon: 'image' },
       { id: 'assets-scene', label: 'Scene', icon: 'grass' },
       { id: 'assets-npcs', label: 'NPCs', icon: 'pets' },
       { id: 'assets-characters', label: 'Characters', icon: 'person' },
@@ -54,10 +54,12 @@ const VIEW_TOOLBAR = MENUS.find((m) => m.label === 'View').items.filter((i) => i
  * it always layers above the blurred side panels (which form their own
  * stacking contexts and would otherwise swallow it).
  */
-export function MenuBar({ onAction, checks = {} }) {
+export function MenuBar({ onAction, checks = {}, flySpeed = 0, fov = 45, onFov }) {
   const [active, setActive] = useState(null);   // { label, left, top } | null
+  const [camera, setCamera] = useState(null);   // { left, top } | null
   const barRef = useRef(null);
   const panelRef = useRef(null);
+  const camRef = useRef(null);
 
   useEffect(() => {
     if (!active) return;
@@ -75,9 +77,35 @@ export function MenuBar({ onAction, checks = {} }) {
     };
   }, [active]);
 
+  // The camera popover dismisses the same way, but independently — opening a
+  // menu shouldn't leave it hanging, and vice versa.
+  useEffect(() => {
+    if (!camera) return;
+    const close = (e) => {
+      if (barRef.current?.contains(e.target)) return;
+      if (camRef.current?.contains(e.target)) return;
+      setCamera(null);
+    };
+    const onKey = (e) => e.key === 'Escape' && setCamera(null);
+    document.addEventListener('pointerdown', close);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('pointerdown', close);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [camera]);
+
   const openMenu = (label, target) => {
     const rect = target.getBoundingClientRect();
+    setCamera(null);
     setActive({ label, left: rect.left, top: rect.bottom + 10 });
+  };
+
+  const toggleCamera = (target) => {
+    if (camera) { setCamera(null); return; }
+    const rect = target.getBoundingClientRect();
+    setActive(null);
+    setCamera({ left: rect.left, top: rect.bottom + 10 });
   };
 
   const activate = (id, label) => {
@@ -123,6 +151,49 @@ export function MenuBar({ onAction, checks = {} }) {
           );
         })}
       </div>
+
+      <span className="menu-sep" aria-hidden="true" />
+
+      <div className="cam-group">
+        <Tooltip content="Camera" placement="bottom">
+          <button
+            type="button"
+            className={`view-tool${camera ? ' on' : ''}`}
+            aria-label="Camera settings"
+            aria-expanded={!!camera}
+            onClick={(e) => toggleCamera(e.currentTarget)}
+          >
+            <span className="icon">videocam</span>
+          </button>
+        </Tooltip>
+        <Tooltip content="Fly speed — scroll the viewport with WASD on to change" placement="bottom">
+          <span className="cam-speed mono">{Math.round(flySpeed)}</span>
+        </Tooltip>
+      </div>
+
+      {camera &&
+        createPortal(
+          <div
+            className="menu-panel cam-panel"
+            ref={camRef}
+            style={{ position: 'fixed', left: camera.left, top: camera.top }}
+          >
+            <div className="cam-row">
+              <span className="cam-label">Field of view</span>
+              <span className="cam-val mono">{fov}°</span>
+            </div>
+            <input
+              type="range" min="20" max="120" step="1" value={fov}
+              onChange={(e) => onFov?.(+e.target.value)}
+              className="vol-slider"
+              style={{ '--fill': `${((fov - 20) / 100) * 100}%` }}
+            />
+            <button type="button" className="cam-reset" onClick={() => onFov?.(45)}>
+              Reset to 45°
+            </button>
+          </div>,
+          document.body,
+        )}
 
       {activeMenu &&
         createPortal(

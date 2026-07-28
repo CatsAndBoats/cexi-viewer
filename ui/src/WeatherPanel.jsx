@@ -200,7 +200,7 @@ export function WeatherPanel({
               aria-pressed={sfxOn}
               onClick={() => onToggleSfx?.(!sfxOn)}
             >
-              <span className="icon eq">graphic_eq</span>
+              <span className="icon eq">airwave</span>
             </button>
           </Tooltip>
           <input

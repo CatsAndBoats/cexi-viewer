@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { Listbox, ListboxButton, ListboxOption, ListboxOptions } from '@headlessui/react';
+import { Tooltip } from './Tooltip.jsx';
 
 // All character data comes fully resolved from lists/characters.json (baked by
 // dev/bake-lists.mjs): races with base skeleton + per-weapon-type battle-idle
@@ -17,6 +18,49 @@ const SLOTS = [
   { key: 'legs', label: 'Legs', section: 'Armor' },
   { key: 'feet', label: 'Feet', section: 'Armor' },
 ];
+
+// Look string (20-byte little-endian blob, hex-encoded to 40 chars).
+// size=1 (equipped), face, race number, then 8 slot words each = (slotIdx << 12) | modelId.
+const RACE_LOOK_NUM = {
+  HumeM: 1, HumeF: 2, ElvaanM: 3, ElvaanF: 4, Tarutaru: 5, Mithra: 7, Galka: 8,
+};
+const LOOK_SLOT_ORDER  = ['head', 'body', 'hands', 'legs', 'feet', 'main', 'sub', 'range'];
+const LOOK_SLOT_IDX    = { head: 1, body: 2, hands: 3, legs: 4, feet: 5, main: 6, sub: 7, range: 8 };
+const LOOK_SLOT_OFFSET = { head: 0x04, body: 0x06, hands: 0x08, legs: 0x0A, feet: 0x0C, main: 0x0E, sub: 0x10, range: 0x12 };
+
+// An item's `id` is "<rowIndex>:<spec>" (e.g. "12:137/11"), so parseInt(id) yields the
+// ROW INDEX, not the model id — those only coincide for faces, whose rows happen to be
+// sequential. Every item carries its real equipment model id as `mid` (baked in by
+// dev/bake-lists.mjs from dev/gear-models.json); use it.
+//
+// `useAlt` selects the alternate equipment table: Tarutaru is one viewer race spanning two
+// look races (5 male / 6 female — its "gender" is only the face), and the two tables assign
+// DIFFERENT model ids to the same armour DAT, so a female-faced Taru must encode the female
+// table's ids (`midAlt`) throughout.
+const modelIdOf = (item, useAlt) => {
+  if (!item) return 0;
+  const id = useAlt && Number.isFinite(item.midAlt) ? item.midAlt : item.mid;
+  return Number.isFinite(id) ? id : 0;
+};
+
+function buildLookHex(race, sel, slots, raceInfo) {
+  const faceItem = slots?.face?.find((it) => it.id === sel.face);
+  // The face can override the look race (Tarutaru); otherwise the race's own byte.
+  const raceNum = faceItem?.lookRace ?? raceInfo?.lookRace ?? RACE_LOOK_NUM[race];
+  if (!raceNum || !slots) return null;
+  const useAlt = raceNum !== (raceInfo?.lookRace ?? RACE_LOOK_NUM[race]);
+  const buf = new Uint8Array(20);
+  const dv  = new DataView(buf.buffer);
+  dv.setUint16(0x00, 1, true);   // size = 1 (equipped)
+  buf[0x02] = modelIdOf(faceItem, useAlt) & 0xFF;
+  buf[0x03] = raceNum;
+  for (const key of LOOK_SLOT_ORDER) {
+    const item    = slots[key]?.find((it) => it.id === sel[key]);
+    const modelId = modelIdOf(item, useAlt);
+    dv.setUint16(LOOK_SLOT_OFFSET[key], ((LOOK_SLOT_IDX[key] << 12) | (modelId & 0x0FFF)) >>> 0, true);
+  }
+  return Array.from(buf).map((b) => b.toString(16).padStart(2, '0')).join('');
+}
 
 // ---------------------------------------------------------------------------
 
@@ -50,6 +94,7 @@ export function useCharacter({ enabled, onLoad, onError }) {
   const lastRace = useRef('');                  // race of the last onLoad (camera keep)
   const restored = useRef(false);               // saved selections applied?
   const carry = useRef({ gear: {}, actionKey: null });   // selections to carry across a race switch
+  const prevSelRef = useRef(null);              // sel snapshot from the last onLoad (for displayPath)
   const raceData = useRef(new Map());           // race id -> full characters.json entry
   const prevEnabled = useRef(false);
   const cbRef = useRef({});
@@ -62,6 +107,7 @@ export function useCharacter({ enabled, onLoad, onError }) {
     setSlotsRace('');
     lastKey.current = '';
     lastRace.current = '';
+    prevSelRef.current = null;
     setRaceState(id);
   };
 
@@ -84,7 +130,8 @@ export function useCharacter({ enabled, onLoad, onError }) {
         if (!res.ok) throw new Error(`${res.status} characters.json`);
         const data = await res.json();
         raceData.current = new Map(data.races.map((r) => [r.id, r]));
-        const rs = data.races.map((r) => ({ id: r.id, label: r.label, base: r.base }));
+        const rs = data.races.map((r) => ({ id: r.id, label: r.label, base: r.base,
+                                            lookRace: r.lookRace }));
         setRaces(rs);
         setRaceState((r) => (rs.some((x) => x.id === r) ? r : rs[0]?.id || ''));
       } catch (err) {
@@ -218,16 +265,33 @@ export function useCharacter({ enabled, onLoad, onError }) {
     const key = `${race}|${unique.join('|')}`;
     if (key === lastKey.current) return;
     lastKey.current = key;
+
+    // Determine the most informative path for the status bar. On a gear swap
+    // (same race), find which slot changed and show its DAT. On a race change
+    // or first entry, show the race skeleton.
+    const isGearSwap = lastRace.current === race;
+    let displayPath = r.base;
+    if (isGearSwap && prevSelRef.current) {
+      for (const s of SLOTS) {
+        if (sel[s.key] !== prevSelRef.current[s.key]) {
+          const item = slots[s.key]?.find((it) => it.id === sel[s.key]);
+          if (item?.paths?.[0]) displayPath = item.paths[0];
+        }
+      }
+    }
+    prevSelRef.current = { ...sel };
+
     cbRef.current.onLoad?.({
       name: r.label,
       paths: unique,
+      displayPath,
       focusPaths,
       weaponSlots,
       // The equipped weapon rests in its own battle stance (btl): App resolves
       // the right entry by the weapon's animation type after parsing it.
       battleTable: raceData.current.get(race)?.battleByType ?? null,
       parts,
-      keepCamera: lastRace.current === race,   // gear/action swap on the same actor
+      keepCamera: isGearSwap,
     });
     lastRace.current = race;
   }, [enabled, races, race, slots, slotsRace, sel, actions, action]);
@@ -324,6 +388,18 @@ export function CharacterList({ pc }) {
   const raceItems = (races ?? []).map((r) => ({ id: r.id, label: r.label }));
   const pick = (key) => (id) => setSel((s) => ({ ...s, [key]: id }));
 
+  const [copied, setCopied] = useState(false);
+  const lookHex = races?.length
+    ? buildLookHex(race, sel, slots, races.find((r) => r.id === race))
+    : null;
+  const copyLook = () => {
+    if (!lookHex) return;
+    navigator.clipboard.writeText(lookHex).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    });
+  };
+
   const slotCtrl = (s) => {
     const items = slots?.[s.key];
     if (!items?.length) return null;
@@ -360,6 +436,25 @@ export function CharacterList({ pc }) {
             {slotCtrl(SLOTS[0]) /* Face */}
             {section('Weapon')}
             {section('Armor')}
+            {lookHex && (
+              <div className="pc-look-panel">
+                <span className="pc-look-label">Look String</span>
+                <div className="pc-look-field">
+                  <input
+                    className="pc-look-input"
+                    type="text"
+                    readOnly
+                    value={lookHex}
+                    onClick={(e) => e.target.select()}
+                  />
+                  <Tooltip content={copied ? 'Copied!' : 'Copy'}>
+                    <button className="pc-look-copy" onClick={copyLook}>
+                      <span className="icon">{copied ? 'check' : 'content_copy'}</span>
+                    </button>
+                  </Tooltip>
+                </div>
+              </div>
+            )}
           </>
         )}
       </div>

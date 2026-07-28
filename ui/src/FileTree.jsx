@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { backend } from '../js/backend.js';
+import { Tooltip } from './Tooltip.jsx';
 
 function naturalCompare(a, b) {
   const na = parseInt(a, 10);
@@ -13,21 +14,40 @@ function naturalCompare(a, b) {
 }
 
 export function FileTree({ rootPath, selectedPath, revealTarget, onSelectFile, onError }) {
+  const handleBrowse = async () => {
+    try {
+      const file = await backend.pickFile(rootPath || null);
+      if (file) onSelectFile(file);
+    } catch (err) {
+      onError?.(`Browse failed: ${err.message ?? err}`);
+    }
+  };
+
   if (!rootPath) return <div id="tree" className="panel" />;
   const rootName = rootPath.split(/[\\/]/).filter(Boolean).pop() ?? rootPath;
   return (
-    <div id="tree" className="panel">
-      <TreeNode
-        key={rootPath}
-        path={rootPath}
-        name={rootName}
-        isDir
-        defaultOpen
-        selectedPath={selectedPath}
-        revealTarget={revealTarget}
-        onSelectFile={onSelectFile}
-        onError={onError}
-      />
+    <div id="tree" className="panel tree-panel">
+      <div className="tree-browse">
+        <Tooltip content="Open any .DAT file" placement="right">
+          <button className="tree-browse-btn" onClick={handleBrowse}>
+            <span className="icon">folder_open</span>
+            Browse…
+          </button>
+        </Tooltip>
+      </div>
+      <div className="tree-scroll">
+        <TreeNode
+          key={rootPath}
+          path={rootPath}
+          name={rootName}
+          isDir
+          defaultOpen
+          selectedPath={selectedPath}
+          revealTarget={revealTarget}
+          onSelectFile={onSelectFile}
+          onError={onError}
+        />
+      </div>
     </div>
   );
 }
