@@ -1,20 +1,61 @@
 # CEXI Model Viewer
 
-FFXI NPC/monster model viewer: file explorer on the left, **WebGL2** viewport on
-the right, wrapped in a **Tauri 2** shell (~7 MB standalone exe, no Electron).
-Skinning runs on the GPU — the vertex shader rotates pre-weighted joint-local
-positions by per-joint pose quaternions; the CPU only evaluates the skeleton
-pose (one quat/trans/scale triplet per joint per frame).
+A FFXI asset browser — **zones, NPCs & monsters, playable characters, textures,
+music and sound effects** — with a **WebGL2** viewport, wrapped in a **Tauri 2**
+shell (~7 MB standalone exe, no Electron). Skinning runs on the GPU: the vertex
+shader rotates pre-weighted joint-local positions by per-joint pose quaternions;
+the CPU only evaluates the skeleton pose (one quat/trans/scale triplet per joint
+per frame).
 
 ## Download
 
 Get the latest release by going to: [Github Releases](https://github.com/CatsAndBoats/cexi-viewer/releases)
 
+## Features
+
+- **Zones** — full zone geometry with day/night time-of-day and weather
+  (auroras, fog, rain, …), adjustable brightness and scene background, a
+  searchable object/placement browser, and zone BGM + ambient sound effects.
+- **NPCs & monsters** — a categorised tree of every entity model. Play any of
+  its animations or schedules, scrub the timeline frame-by-frame, set playback
+  speed (10–200 %), and inspect the bone hierarchy in a skeleton overlay.
+- **Characters** — compose a PC from race, face, weapons and gear. Gear is
+  grouped by set (Artifact / Relic / Empyrean / Ebur / Furia / Ebon) and sorted
+  A–Z; equipped weapons play their weapon-skill animations; the 40-character
+  look string is generated and copyable.
+- **Images** — browse every UI, map and cutscene texture DAT with a filter,
+  per-set list and zoom.
+- **Music & Sound FX** — play any BGW/SPW track (vgmstream-decoded) with a live
+  waveform visualiser, seek bar and loop info.
+- **Throughout** — type-to-filter dropdowns, arrow-key list navigation,
+  reveal-any-DAT in the system file manager, wireframe / unlit / collision /
+  navmesh / skybox overlays, and glTF/FBX model export (via the cexi-tools CLI).
+
 ## Screenshots
 
-![CEXI Model Viewer screenshot](ss/Screenshot%202026-07-25%20005737.png)
+Zones render with weather and time-of-day; the object browser lists every placement:
 
-![CEXI Model Viewer screenshot](ss/Screenshot%202026-07-25%20005840.png)
+![Qufim Island at night, auroras overhead](ss/1.png)
+
+![Lower Jeuno in daylight](ss/6.png)
+
+NPCs and monsters play their animations, with a frame scrubber and speed control:
+
+![Mamool Ja mid-animation](ss/2.png)
+
+![Provenance Watcher](ss/5.png)
+
+Compose a character from gear and weapons, and preview weapon-skill animations:
+
+![Hume Female character with katana weapon skill](ss/3.png)
+
+Browse textures, and play music / sound effects with a waveform visualiser:
+
+![Cutscene concept-art image viewer](ss/4.png)
+
+![Music player with waveform](ss/7.png)
+
+![Sound-effect player](ss/8.png)
 
 ---
 
@@ -22,9 +63,10 @@ Get the latest release by going to: [Github Releases](https://github.com/CatsAnd
 
 | Path | Purpose |
 |---|---|
-| `ui/` | The whole frontend, vanilla ES modules — no bundler, no npm. `dat.js` (DAT section walker + skeleton/mesh/texture/animation parsers), `pose.js` (pose evaluation), `renderer.js` (WebGL2, GPU skinning, DXT via `WEBGL_compressed_texture_s3tc` + CPU fallback), `camera.js`, `app.js`, `backend.js`. |
-| `src-tauri/` | Rust shell. Three IPC commands: `list_dir`, `read_file` (binary via `tauri::ipc::Response`), `default_game_path`. |
+| `ui/` | Frontend, built by Vite. `ui/js/` is the engine as vanilla ES modules — `dat.js` (DAT section walker + skeleton/mesh/texture/animation parsers), `pose.js` (pose evaluation), `renderer.js` (WebGL2, GPU skinning, DXT via `WEBGL_compressed_texture_s3tc` + CPU fallback), `camera.js`, `backend.js`, audio/particle helpers. `ui/src/` is the React UI (viewport, panels, asset lists). |
+| `src-tauri/` | Rust shell. IPC commands for filesystem access (`list_dir`, `read_file`, `write_file`), native pickers, audio decode (`decode_vgmstream`), model export (`cexi_mesh_export`), and reveal-in-file-manager (`reveal_path`). |
 | `dev/serve.py` | Dev server: serves `ui/` plus `/fs` endpoints so the frontend runs in a plain browser without Tauri (`backend.js` falls back automatically). |
+| `dev/bake-lists.mjs` | Regenerates the baked asset lists in `ui/public/lists/` (races, gear, NPCs, music, SFX) from source data. |
 
 ## Build & run
 
