@@ -1,5 +1,5 @@
 import { useLayoutEffect, useRef } from 'react';
-import { Listbox, ListboxButton, ListboxOption, ListboxOptions } from '@headlessui/react';
+import { Combo } from './Combo.jsx';
 import { Tooltip } from './Tooltip.jsx';
 
 // FFXI weather ids → display names (only those present in a zone are listed).
@@ -104,17 +104,11 @@ export function WeatherPanel({
         {showSkyControls ? (
           <div className={`wx-weather${skyboxOn ? '' : ' wx-off'}`}>
             <div className="wx-row">
-              <Listbox value={weather} onChange={(w) => onChange(w, timeMinutes)}>
-                <ListboxButton className="combo-input">
-                  <span className="combo-value">{weatherName(weather)}</span>
-                  <span className="icon combo-chevron">unfold_more</span>
-                </ListboxButton>
-                <ListboxOptions anchor="bottom start" className="combo-options">
-                  {weathers.map((w) => (
-                    <ListboxOption key={w} value={w} className="combo-option">{weatherName(w)}</ListboxOption>
-                  ))}
-                </ListboxOptions>
-              </Listbox>
+              <Combo
+                value={weather}
+                items={weathers.map((w) => ({ id: w, label: weatherName(w) }))}
+                onChange={(w) => onChange(w, timeMinutes)}
+              />
             </div>
 
             <div className="wx-row wx-time-row">
@@ -217,7 +211,7 @@ export function WeatherPanel({
           <Tooltip content="Brightness" placement="top">
             <span className="icon wx-tod-icon">light_mode</span>
           </Tooltip>
-          <Tooltip content="Zone default → unlit" placement="top">
+          <Tooltip content="Unlit" placement="top">
             <input
               type="range" min="0" max="100" step="1" value={brightPct}
               onChange={(e) => onBrightness?.(+e.target.value / 100)}

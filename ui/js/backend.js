@@ -97,4 +97,11 @@ export const backend = {
     if (isTauri()) return tauriInvoke('open_url', { url });
     window.open(url, '_blank', 'noopener,noreferrer');
   },
+
+  /** Shows a file in the system file manager (Explorer/Finder), selected. */
+  async revealPath(path) {
+    if (isTauri()) return tauriInvoke('reveal_path', { path });
+    const res = await fetch(`/fs/reveal?path=${encodeURIComponent(path)}`);
+    if (!res.ok) throw new Error(await res.text());
+  },
 };

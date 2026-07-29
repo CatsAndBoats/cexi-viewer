@@ -21,17 +21,19 @@ export function NpcList({ onSelectEntry, selectedPath, onError }) {
   }, [onError]);
 
   return (
-    <div id="tree" className="panel">
-      {categories === null && <div className="side-note">Loading NPC lists…</div>}
-      {categories?.map((cat) => (
-        <NpcCategory
-          key={cat.name}
-          category={cat}
-          onSelectEntry={onSelectEntry}
-          selectedPath={selectedPath}
-          onError={onError}
-        />
-      ))}
+    <div id="tree" className="panel list-panel">
+      <div className="list-scroll">
+        {categories === null && <div className="side-note">Loading NPC lists…</div>}
+        {categories?.map((cat) => (
+          <NpcCategory
+            key={cat.name}
+            category={cat}
+            onSelectEntry={onSelectEntry}
+            selectedPath={selectedPath}
+            onError={onError}
+          />
+        ))}
+      </div>
     </div>
   );
 }

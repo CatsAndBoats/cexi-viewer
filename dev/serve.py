@@ -76,7 +76,28 @@ class Handler(SimpleHTTPRequestHandler):
             return self._read(parse_qs(url.query).get("path", [""])[0])
         if url.path == "/fs/vgmstream":
             return self._vgmstream(parse_qs(url.query).get("path", [""])[0])
+        if url.path == "/fs/reveal":
+            return self._reveal(parse_qs(url.query).get("path", [""])[0])
         return super().do_GET()
+
+    def _reveal(self, raw):
+        """Dev-mode stand-in for the Tauri reveal_path command."""
+        import subprocess
+        try:
+            target = self._resolve(raw)          # keeps the game-dir sandbox
+            if not target.exists():
+                raise FileNotFoundError(f"not found: {target}")
+            if sys.platform == "win32":
+                # Passed as one argument, never through a shell. explorer exits
+                # non-zero even when it works, so the return code says nothing.
+                subprocess.Popen(["explorer", f"/select,{target}"])
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", "-R", str(target)])
+            else:
+                subprocess.Popen(["xdg-open", str(target.parent)])
+            self._text("ok")
+        except Exception as e:
+            self._error(e)
 
     def _vgmstream(self, raw):
         import subprocess, tempfile, os

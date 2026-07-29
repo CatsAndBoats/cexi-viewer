@@ -1,9 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
-import {
-  Button, Checkbox, Field, Label,
-  Listbox, ListboxButton, ListboxOption, ListboxOptions,
-} from '@headlessui/react';
+import { Button, Checkbox, Field, Label } from '@headlessui/react';
 import { backend } from '../js/backend.js';
+import { Combo } from './Combo.jsx';
 import { parseAudioHeader, toWav, FMT_ATRAC3 } from '../js/audio.js';
 
 const sanitize = (name) => name.replace(/[<>:"/\\|?*]+/g, '_').trim() || 'export';
@@ -140,16 +138,15 @@ export function ExportModal({ open, spec, onClose, onStatus }) {
             <>
               <div className="form-row">
                 <label className="form-label">Output type</label>
-                <Listbox value={opts.format} onChange={(v) => set({ format: v })}>
-                  <ListboxButton className="combo-input export-select">
-                    <span className="combo-value">{opts.format === 'fbx' ? 'FBX (needs Blender)' : 'glTF (.glb)'}</span>
-                    <span className="icon combo-chevron">unfold_more</span>
-                  </ListboxButton>
-                  <ListboxOptions anchor="bottom start" className="combo-options">
-                    <ListboxOption value="glb" className="combo-option">glTF (.glb)</ListboxOption>
-                    <ListboxOption value="fbx" className="combo-option">FBX (needs Blender)</ListboxOption>
-                  </ListboxOptions>
-                </Listbox>
+                <Combo
+                  value={opts.format}
+                  items={[
+                    { id: 'glb', label: 'glTF (.glb)' },
+                    { id: 'fbx', label: 'FBX (needs Blender)' },
+                  ]}
+                  onChange={(v) => set({ format: v })}
+                  className="export-select"
+                />
               </div>
 
               <Toggle checked={opts.allParts} onChange={(v) => set({ allParts: v })}
@@ -166,17 +163,12 @@ export function ExportModal({ open, spec, onClose, onStatus }) {
                   title="Animation freeze frame" hint="Pose the mesh by an animation instead of bind pose." />
                 {opts.animEnabled && (
                   <div className="export-anim-controls">
-                    <Listbox value={opts.anim} onChange={(v) => set({ anim: v, frame: 0 })}>
-                      <ListboxButton className="combo-input">
-                        <span className="combo-value">{opts.anim || '— pick —'}</span>
-                        <span className="icon combo-chevron">unfold_more</span>
-                      </ListboxButton>
-                      <ListboxOptions anchor="bottom start" className="combo-options">
-                        {(spec.animations ?? []).map((a) => (
-                          <ListboxOption key={a.id} value={a.id} className="combo-option">{a.id}</ListboxOption>
-                        ))}
-                      </ListboxOptions>
-                    </Listbox>
+                    <Combo
+                      value={opts.anim}
+                      items={(spec.animations ?? []).map((a) => ({ id: a.id, label: a.id }))}
+                      onChange={(v) => set({ anim: v, frame: 0 })}
+                      placeholder="— pick —"
+                    />
                     <div className="export-frame">
                       <input type="range" min="0" max={Math.max(animFrames - 1, 0)} value={opts.frame}
                         onChange={(e) => set({ frame: +e.target.value })} className="vol-slider"

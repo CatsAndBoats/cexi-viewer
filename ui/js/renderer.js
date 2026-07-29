@@ -460,8 +460,11 @@ export class Renderer {
     this.currentAnimation = null;
     this.animFrame = 0;
     this.playing = false;
+    this.playbackSpeed = 1;    // 1 = 30fps game speed; scaled by the panel slider
     this.showTextures = true;
     this.showWireframe = false;
+    this.showSkeleton = false;
+    this.skeletonLines = null;      // lazily built, reused for the renderer's life
     this.showAlpha = true;
     this.poseDirty = true;
 
@@ -754,6 +757,70 @@ export class Renderer {
     return { vao, vbo, count: n };
   }
 
+  /**
+   * Bone lines for the current pose — one segment per joint back to its parent.
+   * pose.trans[i] is already the joint's world origin, in the same display space
+   * the overlay shader draws in, so the segments need no transform of their own.
+   *
+   * Rebuilt every frame into one reused buffer: the pose moves, and a skeleton
+   * is a couple of hundred vertices. Depth test off, so the rig reads as a whole
+   * rather than burying its far side.
+   *
+   * Uses the joint's real parent, not pose.parentOverrides — those re-parent a
+   * gripped weapon and would draw a bone that isn't anatomically there.
+   */
+  _drawSkeleton(viewProj) {
+    const gl = this.gl;
+    const joints = this.pose?.skeleton?.joints;
+    if (!joints?.length) return;
+
+    if (!this.skeletonLines) {
+      const vbo = gl.createBuffer();
+      const vao = gl.createVertexArray();
+      gl.bindVertexArray(vao);
+      gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+      gl.enableVertexAttribArray(0);
+      gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 24, 0);
+      gl.enableVertexAttribArray(1);
+      gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 24, 12);
+      gl.bindVertexArray(null);
+      this.skeletonLines = { vao, vbo, data: new Float32Array(0) };
+    }
+    const lines = this.skeletonLines;
+    if (lines.data.length < joints.length * 12) lines.data = new Float32Array(joints.length * 12);
+
+    // Root end dim, child end bright: the taper shows which way each bone runs.
+    const d = lines.data;
+    const trans = this.pose.trans;
+    let v = 0;
+    for (let i = 0; i < joints.length; i++) {
+      const parent = joints[i].parent;
+      if (parent < 0 || !trans[parent] || !trans[i]) continue;
+      const a = trans[parent], b = trans[i];
+      d[v] = a[0]; d[v + 1] = a[1]; d[v + 2] = a[2];
+      d[v + 3] = 0.20; d[v + 4] = 0.55; d[v + 5] = 0.75;
+      d[v + 6] = b[0]; d[v + 7] = b[1]; d[v + 8] = b[2];
+      d[v + 9] = 0.65; d[v + 10] = 0.95; d[v + 11] = 1.0;
+      v += 12;
+    }
+    const count = v / 6;
+    if (!count) return;
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, lines.vbo);
+    gl.bufferData(gl.ARRAY_BUFFER, d.subarray(0, v), gl.DYNAMIC_DRAW);
+    gl.useProgram(this.overlayProgram);
+    gl.uniformMatrix4fv(this.overlayUniforms.viewProj, false, viewProj);
+    gl.uniform1f(this.overlayUniforms.opacity, 1);
+    gl.disable(gl.BLEND);
+    gl.disable(gl.DEPTH_TEST);
+    gl.depthMask(false);
+    gl.bindVertexArray(lines.vao);
+    gl.drawArrays(gl.LINES, 0, count);
+    gl.bindVertexArray(null);
+    gl.enable(gl.DEPTH_TEST);
+    gl.depthMask(true);
+  }
+
   /** opts.frame — resume at this frame (gear swap); otherwise start at 0. */
   setAnimation(clip, opts = {}) {
     this.currentAnimation = clip;
@@ -761,6 +828,16 @@ export class Renderer {
     const frame = (opts.frame != null && len > 0) ? opts.frame % len : 0;
     this.animFrame = frame;
     if (this.pose) this.pose.evaluate(clip, frame);
+    this.poseDirty = true;
+  }
+
+  /** Scrub to a game-frame, clamped to the clip. Leaves play state alone, so
+   *  dragging works whether or not the clip is running. */
+  seekTo(frame) {
+    if (!this.currentAnimation || !this.pose) return;
+    const len = this.currentAnimation.lengthInFrames ?? 0;
+    this.animFrame = Math.min(Math.max(frame, 0), len);
+    this.pose.evaluate(this.currentAnimation, this.animFrame);
     this.poseDirty = true;
   }
 
@@ -1041,7 +1118,7 @@ export class Renderer {
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
     if (this.playing && this.currentAnimation && this.pose) {
-      this.animFrame += dtSeconds * 30;   // FFXI runs at 30 game-frames/sec
+      this.animFrame += dtSeconds * 30 * this.playbackSpeed;   // 30 game-frames/sec, scaled
       const len = this.currentAnimation.lengthInFrames;
       if (this.animFrame > len) this.animFrame %= len;
       this.pose.evaluate(this.currentAnimation, this.animFrame);
@@ -1115,7 +1192,10 @@ export class Renderer {
       return;
     }
 
-    if (!this.pose || this.batches.length === 0) return;
+    if (!this.pose) return;
+    // "Just the bones": the rig replaces the mesh rather than overlaying it.
+    if (this.showSkeleton) { this._drawSkeleton(viewProj); return; }
+    if (this.batches.length === 0) return;
 
     gl.useProgram(this.program);
     if (this.poseDirty) {

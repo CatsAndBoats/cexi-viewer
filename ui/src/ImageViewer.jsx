@@ -8,21 +8,32 @@ import { useEffect, useMemo, useRef, useState } from 'react';
  * Textures decode to straight RGBA32 (`parseDatTextures`), so a 2D canvas is
  * enough; the PNG flavour goes to an <img> via a blob URL.
  */
-/**
- * FFXI stores texture alpha at half scale — 128 means fully opaque, and a map
- * image is uniformly 128 across every pixel. Drawn as-is it comes out at 50%
- * and you can see the scene through it. Textures that genuinely use the full
- * 0-255 range exist too (character skins), so scale per texture off its own
- * maximum rather than doubling everything and crushing real gradients.
- */
+// FFXI stores texture alpha at half scale — 128 is fully opaque. Textures that
+// genuinely use the full 0-255 range exist too (character skins), so the doubling
+// is decided per texture from its own maximum rather than applied blindly.
+//
+// DXT3 carries 4-bit alpha, so it cannot encode 128 at all: encoders dither
+// between nibble 7 (119) and nibble 8 (136) to average out at half scale. An
+// "opaque" map therefore peaks at 136, which is why the ceiling is 136 and not
+// 128 — at 128 every DXT3 image failed the test and drew at half opacity.
+const HALF_SCALE_MAX = 136;
+
+// Doubling leaves the 119s at 238, so the dither survives as a ~7% ripple. Both
+// nibbles mean "opaque", so anything that lands near the top after scaling is
+// snapped the rest of the way.
+const OPAQUE_ENOUGH = 230;
+
 function toImageData(texture) {
   const src = texture.data;
   const out = new Uint8ClampedArray(src.length);
   out.set(src);
   let maxAlpha = 0;
   for (let i = 3; i < src.length; i += 4) if (src[i] > maxAlpha) maxAlpha = src[i];
-  if (maxAlpha > 0 && maxAlpha <= 128) {
-    for (let i = 3; i < out.length; i += 4) out[i] = Math.min(255, src[i] * 2);
+  if (maxAlpha > 0 && maxAlpha <= HALF_SCALE_MAX) {
+    for (let i = 3; i < out.length; i += 4) {
+      const a = src[i] * 2;
+      out[i] = a >= OPAQUE_ENOUGH ? 255 : a;
+    }
   }
   return new ImageData(out, texture.width, texture.height);
 }

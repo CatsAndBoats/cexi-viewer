@@ -1,18 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import {
-  Button,
-  Listbox,
-  ListboxButton,
-  ListboxOption,
-  ListboxOptions,
-} from '@headlessui/react';
+import { Button } from '@headlessui/react';
 import { backend } from '../js/backend.js';
 import { animDisplayName, groupAnimations, mergeModels, parseEntity, resolveScheduleClip } from '../js/dat.js';
 import { Renderer } from '../js/renderer.js';
 import { FileTree } from './FileTree.jsx';
 import { MenuBar } from './MenuBar.jsx';
 import { NpcList } from './NpcList.jsx';
-import { ActionCombos, CharacterList, cycleOnArrow, useCharacter } from './CharacterList.jsx';
+import { CharacterList, useCharacter } from './CharacterList.jsx';
+import { AnimationPanel } from './AnimationPanel.jsx';
+import { Combo } from './Combo.jsx';
 import { MusicList, useAudioPlayer } from './MusicList.jsx';
 import { MusicPlayer } from './MusicPlayer.jsx';
 import { SfxList } from './SfxList.jsx';
@@ -23,6 +19,7 @@ import { LoadingOverlay } from './LoadingOverlay.jsx';
 import { SettingsModal } from './SettingsModal.jsx';
 import { ExportModal } from './ExportModal.jsx';
 import { DetailsPanel } from './DetailsPanel.jsx';
+import { SkeletonPanel } from './SkeletonPanel.jsx';
 import { TextureModal } from './TextureModal.jsx';
 import { HelpModal } from './HelpModal.jsx';
 import { parseFloorTexture } from '../js/dat.js';
@@ -48,10 +45,19 @@ const DEFAULT_DAT_SUFFIX = 'ROM\\5\\3.DAT';
 const DEFAULT_BG = '#303438';
 const LAST_DAT_KEY = 'lastDat';
 const LAST_VIEW_KEY = 'lastView';
+const LAST_IMAGE_KEY = 'lastImage';
 const ANIM_SEL_KEY = 'lastAnimSel';
 const VIEWS = ['files', 'npc', 'pc', 'music', 'sfx', 'scene', 'zones', 'images'];
 /** Views that browse individual models, where fly controls are a hindrance. */
 const ORBIT_VIEWS = new Set(['files', 'npc', 'pc']);
+// Zones and Scene are two panels onto the same loaded zone, so moving between
+// them keeps it. Every other view change is a fresh page: whatever the last one
+// had running gets torn down.
+const ZONE_VIEWS = new Set(['zones', 'scene']);
+// The only views that own the audio player. A zone's BGM plays through the same
+// player, so leaving Zones has to stop it too — hence "was it an audio view",
+// not just "is it one now".
+const AUDIO_VIEWS = new Set(['music', 'sfx']);
 
 // A schedule sequence lays segments on a timeline; a joint whose segment hasn't
 // started yet would show bind pose (T-pose flash each loop). Underlay a looping
@@ -108,6 +114,11 @@ export default function App() {
   const settingsRef = useRef(null);
   const animsRef = useRef([]);
   const sourcePathRef = useRef('');
+  // The DAT the status bar names, at its real casing — selectedDat is folded to
+  // lower case for the tree's matching and isn't safe to hand a case-sensitive
+  // filesystem. For composed characters this is the changed slot, not the last
+  // DAT merged, so "show in Explorer" lands on what the user is reading.
+  const shownPathRef = useRef('');
   const drag = useRef({ btn: -1, x: 0, y: 0 });
   const heldKeys = useRef(new Set());
   const wasdRef = useRef(localStorage.getItem('wasd') === '1');
@@ -160,12 +171,33 @@ export default function App() {
   const [currentSchedule, setCurrentSchedule] = useState('');
   const [modelInfo, setModelInfo] = useState(null);
   const [detailsOpen, setDetailsOpen] = useState(false);
+  const [skeletonOpen, setSkeletonOpen] = useState(false);
   const [texWindows, setTexWindows] = useState([]); // [{ id, tex }] open texture viewers
   const texIdRef = useRef(0);
   const [selectedFloor, setSelectedFloor] = useState('');
   const [playing, setPlayingState] = useState(false);
+  // Animation playback rate, 0.1–2.0 (10%–200%). Mirrored to a ref so the
+  // renderer-lifecycle effect can seed a freshly-built renderer without listing
+  // it as a dependency (which would rebuild the renderer on every speed change).
+  const [playbackSpeed, setPlaybackSpeedState] = useState(() => {
+    const v = parseFloat(localStorage.getItem('playbackSpeed'));
+    return Number.isFinite(v) && v >= 0.1 && v <= 2 ? v : 1;
+  });
+  const playbackSpeedRef = useRef(playbackSpeed);
+  const setPlaybackSpeed = useCallback((v) => {
+    const clamped = Math.min(2, Math.max(0.1, v));
+    playbackSpeedRef.current = clamped;
+    setPlaybackSpeedState(clamped);
+    try { localStorage.setItem('playbackSpeed', String(clamped)); } catch { /* quota */ }
+    if (rendererRef.current) rendererRef.current.playbackSpeed = clamped;
+  }, []);
+  // Where the render loop pushes the playhead each frame. A ref, not state:
+  // at 30 fps a state update would re-render the whole panel — and with it
+  // every combo's option list — thirty times a second.
+  const animTick = useRef(null);
   const [showTex, setShowTex] = useState(true);
   const [showWireframe, setShowWireframe] = useState(false);
+  const [showSkeleton, setShowSkeleton] = useState(false);
   const [showAlpha, setShowAlpha] = useState(true);
   const [showUnlit, setShowUnlit] = useState(false);
   const [zoneBrightness, setZoneBrightness] = useState(0); // 0 = zone default, 1 = unlit
@@ -236,6 +268,7 @@ export default function App() {
     rendererRef.current = renderer;
     renderer.setFogOverride({ enabled: fogOn, scale: fogScale });
     renderer.camera.fovDegrees = fov;
+    renderer.playbackSpeed = playbackSpeedRef.current;
     // Restore View > Toggle WASD from last session.
     if (wasdRef.current) renderer.camera.setMode('fly');
     // Seed the toolbar readout so it never shows 0 before the first frame.
@@ -255,6 +288,7 @@ export default function App() {
       // value, so this is a handful of updates, not one per frame.
       const speed = Math.round(renderer.camera.flySpeed);
       if (speed !== shownFlySpeed) { shownFlySpeed = speed; setFlySpeed(speed); }
+      animTick.current?.(renderer.animFrame, renderer.currentAnimation?.lengthInFrames ?? 0);
       raf = requestAnimationFrame(frame);
     };
     raf = requestAnimationFrame(frame);
@@ -263,8 +297,8 @@ export default function App() {
     const onWheel = (e) => {
       e.preventDefault();
       if (wasdRef.current) {
+        // Speed still shows live in the camera-settings readout; no status-bar spam.
         renderer.camera.adjustFlySpeed(e.deltaY < 0 ? 1 : -1);
-        setStatusText(`Fly speed ${Math.round(renderer.camera.flySpeed)}`);
       } else {
         renderer.camera.zoom(-Math.sign(e.deltaY) * 120);
       }
@@ -313,6 +347,10 @@ export default function App() {
   useEffect(() => {
     if (rendererRef.current) rendererRef.current.showWireframe = showWireframe;
   }, [showWireframe]);
+
+  useEffect(() => {
+    if (rendererRef.current) rendererRef.current.showSkeleton = showSkeleton;
+  }, [showSkeleton]);
 
   useEffect(() => {
     if (rendererRef.current) rendererRef.current.showAlpha = showAlpha;
@@ -445,6 +483,7 @@ export default function App() {
       const primaryPath = displayPath ?? paths[paths.length - 1];
       setSelectedDat(primaryPath.toLowerCase());
       setModelPath(relativeName(primaryPath));
+      shownPathRef.current = primaryPath;
       sourcePathRef.current = paths[paths.length - 1];
 
       // Viewbar lists. Group over the WHOLE model so each clip's body-region
@@ -857,6 +896,7 @@ export default function App() {
       resolveZoneTrack(zone.id, hour < 6 || hour >= 18);
       setSelectedDat(abs.toLowerCase());
       setModelPath(rel);
+      shownPathRef.current = abs;
       sourcePathRef.current = abs;
       animsRef.current = [];
       setAnims([]);
@@ -945,7 +985,7 @@ export default function App() {
   }, [getKeyTables, beginLoad, stepLoad, endLoad, setWasd, buildParticleSystem, getWeatherAudio, resolveZoneTrack]);
 
   // Character composer (Assets > Characters) — shared by the left panel and
-  // the viewbar Action combo.
+  // the Animation panel Action combo.
   const pc = useCharacter({
     enabled: leftView === 'pc' && !!settings?.gamePath,
     onLoad: loadNpcEntry,
@@ -959,7 +999,11 @@ export default function App() {
       try {
         const saved = localStorage.getItem('gamePath');
         const gamePath = (saved || (await backend.defaultGamePath())).trim();
-        setSettings(loadSettings(gamePath));
+        const initialSettings = loadSettings(gamePath);
+        setSettings(initialSettings);
+        // Mirror to the ref now: setSettings won't reach it until the next
+        // render, but loadImage() below reads settingsRef.current this tick.
+        settingsRef.current = initialSettings;
 
         if (!gamePath) {
           setSettingsError('Game path not set. Browse to your FINAL FANTASY XI install folder.');
@@ -976,6 +1020,19 @@ export default function App() {
           setStatusText('Game path not found — open Settings to fix it.');
           return;
         }
+
+        // Flat views (Images/Music/SFX) own no 3D model, so reopening on one
+        // must NOT resurrect the last character behind it. Restore what that
+        // page was showing instead and skip the model load entirely.
+        const restoredView = localStorage.getItem(LAST_VIEW_KEY);
+        if (restoredView === 'images') {
+          try {
+            const img = JSON.parse(localStorage.getItem(LAST_IMAGE_KEY) || 'null');
+            if (img?.path) await loadImage(img);
+          } catch { /* stale/corrupt entry — just show the list */ }
+          return;
+        }
+        if (restoredView === 'music' || restoredView === 'sfx') return;   // lists only
 
         // Prefer the last successfully loaded DAT; fall back to the default demo model.
         let paths = null;
@@ -1105,6 +1162,27 @@ export default function App() {
     setPlayingState(p);
   };
 
+  const animControls = {
+    anims, currentAnim, onAnimChange: handleAnimChange,
+    schedules, currentSchedule, onScheduleChange: handleScheduleChange,
+    playing, onTogglePlay: () => setPlaying(!playing),
+    frameSink: animTick, onSeek: (f) => rendererRef.current?.seekTo(f),
+    speed: playbackSpeed, onSpeed: setPlaybackSpeed,
+  };
+
+  /** Status-bar path → show that DAT in the system file manager, selected.
+   *  sourcePathRef keeps the real casing; selectedDat is lowercased for the
+   *  tree's own matching and would be a poor thing to hand the OS. */
+  const revealInExplorer = async () => {
+    const path = shownPathRef.current;
+    if (!path) return;
+    try {
+      await backend.revealPath(path);
+    } catch (err) {
+      setStatusText(`Could not show in Explorer: ${err.message ?? err}`);
+    }
+  };
+
   // Play a raw DAT clip id (e.g. "at00") by switching to its display group ("at0").
   const playClipId = (rawId) => {
     const group = animsRef.current.find((g) => g.id === rawId)
@@ -1152,7 +1230,8 @@ export default function App() {
   // that's the 0x2F environment (re-pushed every frame while weather fades), so
   // these are kept as an override the renderer re-applies rather than a value
   // the environment can overwrite.
-  const [fogOn, setFogOnState] = useState(() => localStorage.getItem('fogOn') !== '0');
+  // Off unless the user turned it on before — absent key = off.
+  const [fogOn, setFogOnState] = useState(() => localStorage.getItem('fogOn') === '1');
   const [fogScale, setFogScaleState] = useState(() => {
     const v = parseFloat(localStorage.getItem('fogScale'));
     return Number.isFinite(v) && v > 0 ? v : 1;
@@ -1175,10 +1254,51 @@ export default function App() {
   const [imageDoc, setImageDoc] = useState(null);       // parseImageDat result + resolved sets
   const [imageSet, setImageSet] = useState(null);
 
+  /** Drop the scene and everything that described it. */
+  const unloadModel = useCallback(() => {
+    rendererRef.current?.setModel(null);
+    modelRef.current = null;
+    // Zone ambience is driven by the particle system, which setModel just threw
+    // away — detach so the weather bed stops instead of holding its last voice.
+    weatherAudioRef.current?.attach(null, null);
+    appliedPlayRef.current = { kind: null, id: '' };
+    setModelInfo(null);
+    setModelPath('');
+    setSelectedDat('');
+    shownPathRef.current = '';
+    sourcePathRef.current = '';
+    setAnims([]);
+    setCurrentAnim('');
+    setSchedules([]);
+    setCurrentSchedule('');
+    setPlayingState(false);
+    setObjectGroups(null);
+    setStatusText('');
+  }, []);
+
+  // One view on screen at a time, each arriving clean. Without this a model
+  // keeps rendering (and animating) behind the Images page, music plays on under
+  // a 3D view, and the GPU carries a scene nobody can see.
+  const prevViewRef = useRef(leftView);
+  useEffect(() => {
+    const prev = prevViewRef.current;
+    if (prev === leftView) return;
+    prevViewRef.current = leftView;
+
+    // Zones <-> Scene share one zone; anything else starts empty. Characters
+    // reloads itself on arrival, so unloading here just clears the old actor.
+    if (!(ZONE_VIEWS.has(prev) && ZONE_VIEWS.has(leftView))) unloadModel();
+    if (!(AUDIO_VIEWS.has(prev) && AUDIO_VIEWS.has(leftView))) player.stop();
+    if (leftView !== 'images') { setImageEntry(null); setImageDoc(null); setImageSet(null); }
+  }, [leftView, unloadModel, player]);
+
   const loadImage = useCallback(async (entry) => {
     const gamePath = settingsRef.current?.gamePath;
     if (!gamePath) { setStatusText('Game path not set — open Settings first.'); return; }
     setImageEntry(entry);
+    // Remember it so reopening on the Images page restores this image rather
+    // than falling through to the default model. Store just {name, path}.
+    try { localStorage.setItem(LAST_IMAGE_KEY, JSON.stringify({ name: entry.name, path: entry.path })); } catch { /* quota */ }
     setImageSet(null);
     setImageDoc(null);
     // Images are 2D and cover the viewport, so anything still in the scene just
@@ -1340,6 +1460,9 @@ export default function App() {
         break;
       case 'toggle-wireframe':
         setShowWireframe((v) => !v);
+        break;
+      case 'toggle-skeleton':
+        setShowSkeleton((v) => !v);
         break;
       case 'toggle-alpha':
         setShowAlpha((v) => {
@@ -1530,6 +1653,7 @@ export default function App() {
         checks={{
           textures: showTex,
           wireframe: showWireframe,
+          skeleton: showSkeleton,
           alpha: showAlpha,
           unlit: showUnlit,
           explorer: explorerOpen,
@@ -1664,78 +1788,24 @@ export default function App() {
 
       {player.current && leftView !== 'zones' && <MusicPlayer player={player} />}
 
-      {!player.current && leftView !== 'zones' && leftView !== 'scene' && (
-        <div id="viewbar" className="panel">
-          {leftView === 'pc' && <ActionCombos pc={pc} />}
-
-          <span className="label">Animation</span>
-
-          <Listbox value={currentAnim} onChange={handleAnimChange}>
-            {({ open }) => (
-              <div
-                style={{ display: 'contents' }}
-                onKeyDownCapture={(e) => cycleOnArrow(e, open, ['', ...anims.map((g) => g.id)], currentAnim, handleAnimChange)}
-              >
-                <ListboxButton className="combo-input">
-                  <span className="combo-value">{currentAnim || '— bind pose —'}</span>
-                  <span className="icon combo-chevron">unfold_more</span>
-                </ListboxButton>
-                <ListboxOptions anchor="bottom start" className="combo-options">
-                  <ListboxOption value="" className="combo-option">— bind pose —</ListboxOption>
-                  {anims.map((g) => (
-                    <ListboxOption key={g.id} value={g.id} className="combo-option">
-                      {g.id}
-                      {g.clip.parts && <span className="opt-badge">{g.clip.parts.length}</span>}
-                    </ListboxOption>
-                  ))}
-                </ListboxOptions>
-              </div>
-            )}
-          </Listbox>
-
-          {schedules.length > 0 && (
-            <>
-              <span className="label">Schedule</span>
-              <Listbox value={currentSchedule} onChange={handleScheduleChange}>
-                {({ open }) => (
-                  <div
-                    style={{ display: 'contents' }}
-                    onKeyDownCapture={(e) => cycleOnArrow(e, open, ['', ...schedules.map((s) => s.id)], currentSchedule, handleScheduleChange)}
-                  >
-                    <ListboxButton className="combo-input">
-                      <span className="combo-value">{currentSchedule || '— none —'}</span>
-                      <span className="icon combo-chevron">unfold_more</span>
-                    </ListboxButton>
-                    <ListboxOptions anchor="bottom start" className="combo-options">
-                      <ListboxOption value="" className="combo-option">— none —</ListboxOption>
-                      {schedules.map((s) => (
-                        <ListboxOption key={s.id} value={s.id} className="combo-option">
-                          {s.id}
-                          {s.clipIds.length > 1 && <span className="opt-badge">{s.clipIds.length}</span>}
-                        </ListboxOption>
-                      ))}
-                    </ListboxOptions>
-                  </div>
-                )}
-              </Listbox>
-            </>
-          )}
-
-          <Tooltip content="Play / stop animation">
-            <Button
-              className="icon-btn"
-              onClick={() => setPlaying(!playing)}
-            >
-              <span className="icon fill">{playing ? 'stop' : 'play_arrow'}</span>
-            </Button>
-          </Tooltip>
-        </div>
+      {/* Only the views that actually put a model on screen get playback
+          controls — Images/Music/SFX have their own right-hand panels. */}
+      {!player.current && ORBIT_VIEWS.has(leftView) && (
+        <AnimationPanel pc={leftView === 'pc' ? pc : null} anim={animControls} />
       )}
 
       <div id="status" className="panel mono">
-        <span id="statusPath">
-          {player.current ? relativeName(player.current.path) : (modelPath || '—')}
-        </span>
+        {!player.current && modelPath && selectedDat ? (
+          <Tooltip content="Show in Explorer">
+            <button id="statusPath" className="status-path-link" onClick={revealInExplorer}>
+              {modelPath}
+            </button>
+          </Tooltip>
+        ) : (
+          <span id="statusPath">
+            {player.current ? relativeName(player.current.path) : (modelPath || '—')}
+          </span>
+        )}
         <span className="hints">
           {player.current ? (
             `${player.playing ? 'playing' : 'paused'}: ${player.current.name ?? `music${player.current.num?.padStart(3, '0')}`}`
@@ -1750,8 +1820,10 @@ export default function App() {
                   </button>
                 </>
               )}
-              {modelInfo && (
+              {modelInfo && ORBIT_VIEWS.has(leftView) && (
                 <>
+                  <span className="status-sep">·</span>
+                  <button className="status-link" onClick={() => setSkeletonOpen((v) => !v)}>Skeleton</button>
                   <span className="status-sep">·</span>
                   <button className="status-link" onClick={() => setDetailsOpen((v) => !v)}>Details</button>
                 </>
@@ -1778,14 +1850,27 @@ export default function App() {
                   </button>
                 </>
               )}
-              <span className="status-sep">·</span>
-              <button className="status-link" onClick={() => setDetailsOpen((v) => !v)}>Details</button>
+              {ORBIT_VIEWS.has(leftView) && (
+                <>
+                  <span className="status-sep">·</span>
+                  <button className="status-link" onClick={() => setSkeletonOpen((v) => !v)}>Skeleton</button>
+                  <span className="status-sep">·</span>
+                  <button className="status-link" onClick={() => setDetailsOpen((v) => !v)}>Details</button>
+                </>
+              )}
             </>
           ) : ''}
         </span>
       </div>
 
-      {detailsOpen && modelInfo && !player.current && (
+      {skeletonOpen && !player.current && ORBIT_VIEWS.has(leftView) && (
+        <SkeletonPanel
+          pose={rendererRef.current?.pose ?? null}
+          onClose={() => setSkeletonOpen(false)}
+        />
+      )}
+
+      {detailsOpen && modelInfo && !player.current && ORBIT_VIEWS.has(leftView) && (
         <DetailsPanel
           info={modelInfo}
           animClip={animsRef.current.find((g) => g.id === currentAnim)?.clip ?? null}

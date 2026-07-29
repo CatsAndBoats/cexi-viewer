@@ -54,12 +54,14 @@ export function SfxList({ gamePath, player, onError }) {
   }, [gamePath]);
 
   return (
-    <div id="tree" className="panel">
-      {roots === null && <div className="side-note">Scanning sound effects…</div>}
-      {roots?.length === 0 && <div className="side-note">No sound effects found.</div>}
-      {roots?.map((r) => (
-        <SfxRoot key={r.root} group={r} meta={meta} player={player} onError={onError} />
-      ))}
+    <div id="tree" className="panel list-panel">
+      <div className="list-scroll">
+        {roots === null && <div className="side-note">Scanning sound effects…</div>}
+        {roots?.length === 0 && <div className="side-note">No sound effects found.</div>}
+        {roots?.map((r) => (
+          <SfxRoot key={r.root} group={r} meta={meta} player={player} onError={onError} />
+        ))}
+      </div>
     </div>
   );
 }

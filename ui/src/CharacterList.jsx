@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Listbox, ListboxButton, ListboxOption, ListboxOptions } from '@headlessui/react';
+import { Combo } from './Combo.jsx';
 import { Tooltip } from './Tooltip.jsx';
 
 // All character data comes fully resolved from lists/characters.json (baked by
@@ -43,6 +43,73 @@ const modelIdOf = (item, useAlt) => {
   return Number.isFinite(id) ? id : 0;
 };
 
+// ---------------------------------------------------------------------------
+
+// Gear families worth their own section in the armour dropdowns. Order here is
+// the order they appear under the plain run. Weapons and faces match none of
+// these and keep their own groups (weapon type).
+const GEAR_SECTIONS = ['Artifact', 'Relic', 'Empyrean', 'Ebur', 'Furia', 'Ebon'];
+
+/** A-Z, but "None" stays pinned to the top of its group rather than sorting
+ *  into the N's. Numeric collation keeps the id-style labels ("29/21",
+ *  "183/67") in count order instead of 1-before-2-before-9. */
+function byLabel(a, b) {
+  const isNone = (it) => it.label.toLowerCase() === 'none';
+  if (isNone(a) !== isNone(b)) return isNone(a) ? -1 : 1;
+  return a.label.localeCompare(b.label, undefined, { numeric: true, sensitivity: 'base' });
+}
+
+/**
+ * Sort inside each group without moving the groups themselves — they stay in
+ * the order they first appear, so weapon types keep their run and stay
+ * contiguous (groupRows only heads a section when the group *changes*).
+ */
+function sortWithinGroups(items) {
+  const order = [];
+  const groups = new Map();
+  for (const it of items) {
+    const key = it.group ?? '';
+    if (!groups.has(key)) { groups.set(key, []); order.push(key); }
+    groups.get(key).push(it);
+  }
+  return order.flatMap((key) => groups.get(key).sort(byLabel));
+}
+
+/** "Fighter's Lorica (WAR Artifact)" -> Artifact; "Ebur Cuirass" -> Ebur. */
+function gearSection(label) {
+  // Reforged sets carry job + tier in a trailing parenthetical. One entry reads
+  // "(RUN AF@)" — the same Artifact tier, mis-typed in the source list.
+  const tier = label.match(/\(\w+ (Artifact|Relic|Empyrean|AF@)\)$/);
+  if (tier) return tier[1] === 'AF@' ? 'Artifact' : tier[1];
+  const family = label.match(/^(Ebur|Furia|Ebon)\b/);
+  return family ? family[1] : null;
+}
+
+/**
+ * Plain gear first, then one section per family, everything A-Z within its own
+ * section. The families can't just be labelled where they lie: the three colour
+ * variants are stored piece by piece, so Ebon/Furia/Ebur alternate all the way
+ * down the list and only gathering them makes a section.
+ *
+ * Sorts a copy throughout — the source arrays live in raceData and are re-read
+ * on every race switch.
+ */
+function orderSlotItems(items) {
+  const found = new Map(GEAR_SECTIONS.map((name) => [name, []]));
+  const plain = [];
+  for (const it of items) {
+    const name = gearSection(it.label);
+    if (name) found.get(name).push({ ...it, group: name });
+    // The source splits each armour list in half with a rule of dashes. It has
+    // no name to head a section with, so that run just reads as plain gear.
+    else plain.push(it.group?.startsWith('---') ? { ...it, group: null } : it);
+  }
+  return [
+    ...sortWithinGroups(plain),
+    ...GEAR_SECTIONS.flatMap((name) => found.get(name).sort(byLabel)),
+  ];
+}
+
 function buildLookHex(race, sel, slots, raceInfo) {
   const faceItem = slots?.face?.find((it) => it.id === sel.face);
   // The face can override the look race (Tarutaru); otherwise the race's own byte.
@@ -67,7 +134,7 @@ function buildLookHex(race, sel, slots, raceInfo) {
 /**
  * Character composer state. Owns the race index, the per-race slot/action
  * lists, and the current selections; assembles the merged DAT path list and
- * calls onLoad whenever it changes. Lives in App so the viewbar Action combo
+ * calls onLoad whenever it changes. Lives in App so the Animation panel
  * and the left panel share one instance.
  */
 const PC_STATE_KEY = 'pcState';
@@ -164,7 +231,8 @@ export function useCharacter({ enabled, onLoad, onError }) {
     const slotMap = {};
     const defaults = {};
     for (const s of SLOTS) {
-      const items = entry.slots?.[s.key] ?? null;
+      const raw = entry.slots?.[s.key] ?? null;
+      const items = raw?.length ? orderSlotItems(raw) : raw;
       slotMap[s.key] = items;
       if (items?.length) {
         const none = items.find((it) => it.label.toLowerCase() === 'none');
@@ -232,7 +300,7 @@ export function useCharacter({ enabled, onLoad, onError }) {
     // The base DAT holds only the lower-body motion slot; motionExtra adds the
     // upper-body + waist companion packs (baked in dev/bake-lists.mjs) so
     // locomotion animates the whole body, not just the legs. They stay out of
-    // focusPaths so they feed playback without flooding the viewbar lists.
+    // focusPaths so they feed playback without flooding the Animation lists.
     const paths = [r.base, ...(raceData.current.get(race)?.motionExtra ?? [])];
     const weaponSlots = {};
     // Per-part breakdown for the Details panel (label + which DATs each slot contributed).
@@ -256,7 +324,7 @@ export function useCharacter({ enabled, onLoad, onError }) {
     const act = actions.find((a) => a.id === action);
     if (action && !act) return;
     // Focus = the schedule DATs only. Motion packs still load (schedules
-    // resolve clips out of them) but must not flood the viewbar lists.
+    // resolve clips out of them) but must not flood the Animation lists.
     const focusPaths = act ? [...act.paths] : [];
     if (act) paths.push(...focusPaths, ...(act.motionPaths ?? []));
 
@@ -304,85 +372,6 @@ export function useCharacter({ enabled, onLoad, onError }) {
 
 // ---------------------------------------------------------------------------
 
-function groupRows(items) {
-  // Headers only when the list actually spans multiple groups.
-  const multi = new Set(items.map((it) => it.group ?? null)).size > 1;
-  const rows = [];
-  let last = null;
-  for (const it of items) {
-    if (multi && it.group && it.group !== last) rows.push({ header: it.group, key: `h${rows.length}` });
-    last = it.group;
-    rows.push({ item: it, key: it.id });
-  }
-  return rows;
-}
-
-/**
- * Native-select style arrow keys: while a combo's button is focused and its
- * panel is CLOSED, ArrowUp/ArrowDown steps the value directly (clamped, no
- * wrap) so gear/animation can be flipped through quickly. Headless UI returns
- * focus to the button after each pick, so cycling chains naturally.
- *
- * Must be attached with onKeyDownCapture: ListboxButton's own keydown opens
- * the panel and stops propagation, so a bubble-phase handler never runs.
- */
-export function cycleOnArrow(e, open, ids, value, onChange) {
-  if (open || (e.key !== 'ArrowDown' && e.key !== 'ArrowUp')) return;
-  if (ids.length === 0) return;
-  e.preventDefault();
-  e.stopPropagation();
-  const dir = e.key === 'ArrowDown' ? 1 : -1;
-  const next = ids[Math.min(Math.max(ids.indexOf(value) + dir, 0), ids.length - 1)];
-  if (next !== undefined && next !== value) onChange(next);
-}
-
-function PcCombo({ value, items, onChange, placeholder = '—' }) {
-  const current = items.find((i) => i.id === value);
-  return (
-    <Listbox value={value ?? ''} onChange={onChange}>
-      {({ open }) => (
-        <div
-          style={{ display: 'contents' }}
-          onKeyDownCapture={(e) => cycleOnArrow(e, open, items.map((i) => i.id), value, onChange)}
-        >
-          <ListboxButton className="combo-input">
-            <span className="combo-value">{current?.label ?? placeholder}</span>
-            <span className="icon combo-chevron">unfold_more</span>
-          </ListboxButton>
-          <ListboxOptions anchor="bottom start" className="combo-options">
-            {groupRows(items).map((r) =>
-              r.header !== undefined
-                ? <div key={r.key} className="combo-group">{r.header}</div>
-                : (
-                  <ListboxOption key={r.key} value={r.item.id} className="combo-option">
-                    {r.item.label}
-                  </ListboxOption>
-                ),
-            )}
-          </ListboxOptions>
-        </div>
-      )}
-    </Listbox>
-  );
-}
-
-/** Viewbar "Action" selectors: category (Battle, Emote, G. Katana…) + entry. */
-export function ActionCombos({ pc }) {
-  const { actionGroups, actionGroup, setActionGroup, actionEntries, action, setAction } = pc;
-  if (actionGroups.length === 0) return null;
-  return (
-    <>
-      <span className="label">Action</span>
-      <PcCombo
-        value={actionGroup}
-        items={actionGroups.map((g) => ({ id: g, label: g }))}
-        onChange={setActionGroup}
-      />
-      <PcCombo value={action} items={actionEntries} onChange={setAction} placeholder="— none —" />
-    </>
-  );
-}
-
 export function CharacterList({ pc }) {
   const { races, race, setRace, slots, sel, setSel } = pc;
   const raceItems = (races ?? []).map((r) => ({ id: r.id, label: r.label }));
@@ -406,7 +395,7 @@ export function CharacterList({ pc }) {
     return (
       <div className="pc-ctrl" key={s.key}>
         <span className="pc-ctrl-label">{s.label}</span>
-        <PcCombo value={sel[s.key]} items={items} onChange={pick(s.key)} />
+        <Combo value={sel[s.key]} items={items} onChange={pick(s.key)} />
       </div>
     );
   };
@@ -431,14 +420,14 @@ export function CharacterList({ pc }) {
           <>
             <div className="pc-ctrl">
               <span className="pc-ctrl-label">Race</span>
-              <PcCombo value={race} items={raceItems} onChange={setRace} />
+              <Combo value={race} items={raceItems} onChange={setRace} />
             </div>
             {slotCtrl(SLOTS[0]) /* Face */}
             {section('Weapon')}
             {section('Armor')}
             {lookHex && (
-              <div className="pc-look-panel">
-                <span className="pc-look-label">Look String</span>
+              <>
+                <div className="side-separator">Look String</div>
                 <div className="pc-look-field">
                   <input
                     className="pc-look-input"
@@ -453,7 +442,7 @@ export function CharacterList({ pc }) {
                     </button>
                   </Tooltip>
                 </div>
-              </div>
+              </>
             )}
           </>
         )}

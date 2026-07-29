@@ -8,7 +8,7 @@
       "name": "Abyssea",
       "entries": [
         {"name":"Abyssea Scroll Bomb","variants":["ROM\\172\\67.DAT"],"base":null},
-        {"separator":"/1250/78,Ironclad Observer"},
+        {"name":"Ironclad Observer","variants":["ROM\\250\\78.DAT"],"base":null},
         {"name":"Amoeban","variants":["ROM\\250\\79.DAT"],"base":null},
         {"name":"Murex","variants":["ROM\\250\\80.DAT"],"base":null},
         {"name":"Clionid","variants":["ROM\\245\\35.DAT"],"base":null},
@@ -1352,7 +1352,7 @@
         {"name":"Dragon","variants":["ROM\\5\\62.DAT","ROM\\5\\63.DAT","ROM\\224\\23.DAT","ROM\\343\\18.DAT"],"base":null},
         {"name":"Wyvern","variants":["ROM\\97\\81.DAT","ROM\\150\\5.DAT","ROM\\249\\71.DAT","ROM\\272\\90.DAT","ROM\\286\\80.DAT"],"base":null},
         {"name":"Wyvern (Pet)","variants":["ROM\\97\\74.DAT","ROM\\119\\76.DAT","ROM\\130\\108.DAT"],"base":null},
-        {"separator":"1/146/70;1/172/74;1/249/67;"},
+        {"name":"Wyrm (NM)","variants":["ROM\\146\\70.DAT","ROM\\172\\74.DAT","ROM\\249\\67.DAT"],"base":null},
         {"name":"Zilant","variants":["ROM\\239\\72.DAT"],"base":null},
         {"name":"Wyrm","variants":["ROM\\249\\54.DAT","ROM\\258\\58.DAT","ROM\\259\\12.DAT"],"base":null},
         {"name":"Puk","variants":["ROM\\249\\64.DAT","ROM\\258\\45.DAT","ROM\\258\\46.DAT"],"base":null},

@@ -98,7 +98,12 @@ export function parseSlotCsv(text) {
       // Labeled row: one entry, all DATs load together (0 paths = the None sentinel).
       items.push({ id: `${items.length}:${spec}`, label, group, paths });
     } else {
-      for (const p of paths) items.push({ id: `${items.length}:${p}`, label: specLabel(p), group, paths: [p] });
+      // No label in the source, so the DAT path stands in for a name. `auto`
+      // marks these as the only rows a generated name may overwrite — curated
+      // labels like "Melee Cyclas (MNK Relic)" must survive untouched.
+      for (const p of paths) {
+        items.push({ id: `${items.length}:${p}`, label: specLabel(p), group, paths: [p], auto: true });
+      }
     }
   }
   return items;

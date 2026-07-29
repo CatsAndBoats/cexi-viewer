@@ -64,12 +64,14 @@ export function MusicList({ gamePath, onError, player }) {
   }, [gamePath]);
 
   return (
-    <div id="tree" className="panel">
-      {roots === null && <div className="side-note">Scanning music…</div>}
-      {roots?.length === 0 && <div className="side-note">No music found under the game folder.</div>}
-      {roots?.map((group) => (
-        <MusicGroup key={group.root} group={group} player={player} onError={onError} />
-      ))}
+    <div id="tree" className="panel list-panel">
+      <div className="list-scroll">
+        {roots === null && <div className="side-note">Scanning music…</div>}
+        {roots?.length === 0 && <div className="side-note">No music found under the game folder.</div>}
+        {roots?.map((group) => (
+          <MusicGroup key={group.root} group={group} player={player} onError={onError} />
+        ))}
+      </div>
     </div>
   );
 }

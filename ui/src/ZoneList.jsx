@@ -82,19 +82,21 @@ export function ZoneList({ selectedPath, onSelectZone, onError }) {
           spellCheck={false}
         />
       </div>
-      {zones === null && <div className="side-note">Loading zones…</div>}
-      {zones && total === 0 && <div className="side-note">No zones in lists/zones.json.</div>}
-      {zones && total > 0 && shown === 0 && <div className="side-note">No zones match “{query}”.</div>}
-      {groups?.map((g) => (
-        <ZoneGroup
-          key={g.key}
-          group={g}
-          selectedPath={selectedPath}
-          onSelectZone={onSelectZone}
-          defaultOpen={!query && g.key === 'ROM'}
-          forceOpen={!!query}
-        />
-      ))}
+      <div className="list-scroll">
+        {zones === null && <div className="side-note">Loading zones…</div>}
+        {zones && total === 0 && <div className="side-note">No zones in lists/zones.json.</div>}
+        {zones && total > 0 && shown === 0 && <div className="side-note">No zones match “{query}”.</div>}
+        {groups?.map((g) => (
+          <ZoneGroup
+            key={g.key}
+            group={g}
+            selectedPath={selectedPath}
+            onSelectZone={onSelectZone}
+            defaultOpen={!query && g.key === 'ROM'}
+            forceOpen={!!query}
+          />
+        ))}
+      </div>
       {zones && total > 0 && (
         <div className="side-note zone-count">
           {query ? `${shown} / ${total}` : `${total}`} zones

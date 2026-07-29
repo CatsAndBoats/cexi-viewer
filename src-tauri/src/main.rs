@@ -352,6 +352,43 @@ fn open_url(url: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Opens the system file manager with `path` selected.
+///
+/// The path goes in as a single argument and never through a shell, so it can't
+/// be re-read as further arguments. Explorer exits non-zero even when it works,
+/// so spawning is the only thing worth checking.
+#[tauri::command]
+fn reveal_path(path: String) -> Result<(), String> {
+    let target = Path::new(&path);
+    if !target.exists() {
+        return Err(format!("not found: {path}"));
+    }
+
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        let mut c = std::process::Command::new("explorer");
+        c.arg(format!("/select,{}", target.display()));
+        c
+    };
+    #[cfg(target_os = "macos")]
+    let mut cmd = {
+        let mut c = std::process::Command::new("open");
+        c.arg("-R").arg(target);
+        c
+    };
+    // No portable "select the file" on Linux, so settle for its folder.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut cmd = {
+        let mut c = std::process::Command::new("xdg-open");
+        c.arg(target.parent().unwrap_or(target));
+        c
+    };
+
+    cmd.spawn()
+        .map_err(|e| format!("failed to open file manager: {e}"))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -454,7 +491,8 @@ fn main() {
             decode_vgmstream,
             cexi_mesh_export,
             cexi_available,
-            open_url
+            open_url,
+            reveal_path
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

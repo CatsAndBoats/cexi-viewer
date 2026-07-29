@@ -262,6 +262,17 @@
   user-select: none;
 }
 .tree-panel { display: flex; flex-direction: column; overflow: hidden; padding: 0; }
+
+/* Panels that are nothing but one long list. The scroll sits on an inner
+   element, not the panel, so the bar stays inside the rounded corners — same
+   shape as .tree-panel/.pc-panel. Without it the rows just run off the bottom
+   of a short window, since #tree is fixed to top/bottom and can't grow. */
+.list-panel { display: flex; flex-direction: column; overflow: hidden; padding: 0; }
+.list-scroll { flex: 1 1 auto; overflow: auto; padding: 10px 0; }
+/* These carry tabIndex so the arrow keys reach them (see useListArrows). That
+   makes the UA draw a focus ring around the whole scroller, which reads as a
+   stray border — the highlighted row is the feedback that matters. */
+.list-scroll:focus, .list-scroll:focus-visible { outline: none; }
 .tree-browse {
   flex: 0 0 auto;
   padding: 7px 10px;
@@ -343,42 +354,33 @@
   gap: 8px;
 }
 .pc-ctrl { display: flex; align-items: center; gap: 10px; }
-.pc-ctrl-label { color: var(--muted); font-weight: 500; flex: 0 0 56px; }
+/* min-width:0 beats the automatic minimum size on flex items — without it a
+   label wider than the basis pushes its control out of the column. */
+.pc-ctrl-label {
+  color: var(--muted); font-weight: 500;
+  flex: 0 0 56px; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 .pc-ctrl .combo-input { flex: 1 1 auto; width: auto; min-width: 0; }
 .pc-panel .side-separator { padding: 10px 0 2px; }
 .pc-footer { flex: 0 0 auto; border-top: 1px solid var(--ring); padding: 4px 12px 10px; }
 .pc-footer .side-separator { padding: 8px 0 2px; }
 .pc-footer .side-note { padding: 2px 0; }
 
-.pc-look-panel {
-  border: 1px solid var(--ring-strong);
-  border-radius: 7px;
-  background: rgba(0, 0, 0, 0.18);
-  padding: 9px 11px 10px;
-  display: flex;
-  flex-direction: column;
-  gap: 7px;
-}
-.pc-look-label {
-  color: var(--gray-500);
-  font: 600 10px/1 var(--font-ui);
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-}
 .pc-look-field {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
 }
-.pc-look-input {
+/* Out-specifies theme.css's input[type='text'], which sizes for prose — 40 hex
+   characters only fit the sidebar at the smaller face. */
+.pc-look-field .pc-look-input {
   flex: 1 1 auto;
   min-width: 0;
-  background: transparent;
-  border: none;
   outline: none;
   color: var(--gray-200);
-  font: 400 10px/1 var(--font-mono);
-  padding: 5px 6px;
+  font: 400 10px/1.4 var(--font-mono);
+  padding: 6px 8px;
   cursor: text;
 }
 .pc-look-copy {
@@ -397,6 +399,23 @@
 .pc-look-copy:hover { background: rgba(255,255,255,0.08); color: var(--gray-200); }
 .pc-look-copy .icon { font-size: 14px; }
 
+/* Playback sits on a combo row, so it takes the combo's width. Deliberately not
+   .icon-btn — that pins buttons to a 30px square. */
+.pc-play { flex: 1 1 auto; }
+.pc-play .icon { font-size: 16px; }
+
+/* margin:0 drops the UA's 2px on range inputs, which would inset the track from
+   the combo column above it. */
+.pc-frame-slider { flex: 1 1 auto; min-width: 0; margin: 0; }
+.pc-frame-slider:disabled { opacity: 0.4; }
+.pc-frame-num {
+  flex: 0 0 auto;
+  color: var(--gray-500);
+  font-size: 11px;
+  min-width: 44px;
+  text-align: right;
+}
+
 /* @Group headers inside gear/action dropdowns */
 .combo-group {
   color: var(--gray-500);
@@ -404,6 +423,7 @@
   text-transform: uppercase;
   letter-spacing: 0.04em;
   padding: 7px 9px 2px;
+  white-space: nowrap;
 }
 
 /* --- Scene panel (floors + fog/bg controls) -------------------------------- */
@@ -430,12 +450,12 @@
 
 /* --- Zone panel ----------------------------------------------------------- */
 
-.zone-panel { display: flex; flex-direction: column; padding: 0; }
+.zone-panel { display: flex; flex-direction: column; overflow: hidden; padding: 0; }
+.zone-panel .zone-count { flex: 0 0 auto; }
 .zone-search {
   flex: 0 0 auto;
   display: flex; align-items: center; gap: 8px;
   padding: 10px 12px;
-  padding-top: 5px;
   border-bottom: 1px solid var(--ring);
 }
 .zone-search .icon { color: var(--gray-500); font-size: 18px; }
@@ -456,29 +476,21 @@
 .node.selected > .row .zone-id { color: rgba(0, 0, 0, 0.5); }
 .zone-count { border-top: 1px solid var(--ring); margin-top: 4px; }
 
-/* --- View bar ------------------------------------------------------------- */
+/* --- Playback panel -------------------------------------------------------- */
 
-#viewbar {
+/* Same top-right band and width as #weather / #placements, so the three never
+   disagree about where that column sits. Rows reuse .pc-ctrl so the labels line
+   up exactly like the Characters panel's gear slots. */
+#animbar {
   top: 12px; right: 12px;
-  display: flex; align-items: center; gap: 10px;
-  padding: 8px 10px;
-  /* Stay clear of the menubar/side panel at small widths: cap the width and
-     wrap into extra right-anchored rows instead of sliding underneath. */
-  max-width: calc(100vw - 380px);
-  flex-wrap: wrap;
-  justify-content: flex-end;
-  row-gap: 6px;
+  width: 320px;
+  padding: 6px 12px 12px;
+  display: flex; flex-direction: column; gap: 8px;
 }
-#viewbar .label { color: var(--muted); font-weight: 500; }
-
-@media (max-width: 1500px) {
-  #viewbar .combo-input { width: 140px; }
-}
-@media (max-width: 1280px) {
-  #viewbar { gap: 8px; }
-  #viewbar .label { display: none; }   /* combos read fine without captions when space is tight */
-  #viewbar .combo-input { width: 126px; }
-}
+#animbar .side-separator { padding: 4px 0 2px; }
+/* Blue icon beside the title, matching the other panel headers. */
+.anim-title { display: flex; align-items: center; gap: 6px; }
+.anim-title .icon { color: var(--accent); font-size: 18px; }
 
 /* --- Status bar ------------------------------------------------------------ */
 
@@ -504,6 +516,13 @@
   color: var(--accent); font: inherit; cursor: pointer;
 }
 .status-link:hover { text-decoration: underline; background: none; }
+/* The path reads as text until hovered — it's a whole-width target, so styling
+   it like the accent links would shout. */
+.status-path-link {
+  background: none; border: none; box-shadow: none; min-height: 0; padding: 0;
+  font: inherit; text-align: left; cursor: pointer;
+}
+.status-path-link:hover { background: none; color: var(--accent); text-decoration: underline; }
 
 /* --- Zone objects panel (top-right, same band as viewbar) ----------------- */
 
@@ -517,11 +536,9 @@
 .wx-header {
   display: flex; align-items: center; gap: 6px;
   padding: 7px 10px 7px 12px;
-  border-bottom: 1px solid var(--ring);
   min-height: 38px;
 }
 .wx-header > .icon { color: var(--accent); font-size: 18px; }
-.wx-title { flex: 1 1 auto; font-weight: 600; }
 .wx-time { color: var(--gray-300); font-size: 12px; margin-right: 8px; }
 .wx-switch { flex: 0 0 auto; }
 .wx-body { padding: 10px 12px; display: flex; flex-direction: column; gap: 9px; }
@@ -649,13 +666,10 @@ body:has(#weather) #placements {
 .plc-header {
   display: flex; align-items: center; gap: 6px;
   padding: 7px 8px 7px 12px;
-  border-bottom: 1px solid var(--ring);
   flex: 0 0 auto;
   min-height: 38px;
 }
-#placements.minimized .plc-header { border-bottom: none; }
 .plc-header > .icon { color: var(--accent); font-size: 18px; }
-.plc-title { flex: 1 1 auto; font-weight: 600; }
 .plc-meta { color: var(--gray-400); font-size: 11px; margin-right: 2px; }
 .plc-tool {
   width: 26px; height: 26px; min-height: 0;
@@ -684,6 +698,7 @@ body:has(#weather) #placements {
 .plc-search input:focus { border-color: var(--accent); }
 .plc-search input::placeholder { color: var(--gray-500); }
 .plc-body { flex: 1 1 auto; overflow: auto; padding: 4px 0; min-height: 0; }
+.plc-body:focus, .plc-body:focus-visible { outline: none; }   /* see .list-scroll */
 .plc-group > .plc-mesh .caret { transition: transform 0.12s ease; }
 .plc-group.open > .plc-mesh .caret { transform: rotate(90deg); }
 .plc-row {
@@ -737,20 +752,55 @@ body.plc-resizing { cursor: ns-resize !important; user-select: none; }
   display: flex; flex-direction: column;
   z-index: 30;
 }
-/* Viewbar sits left of the objects panel (same top band) */
-#viewbar { z-index: 25; }
-body:has(#placements) #viewbar {
-  right: 344px;
-  max-width: calc(100vw - 700px);
+/* Playback panel sits left of the objects panel (same top band) */
+#animbar { z-index: 25; }
+body:has(#placements) #animbar { right: 344px; }
+
+/* --- Skeleton panel (bone hierarchy) --------------------------------------- */
+
+/* Flush right, same as Details — the two overlap when both are open. */
+#skeleton {
+  right: 12px; bottom: 52px;
+  width: 420px; max-height: 60vh;
+  display: flex; flex-direction: column;
+  z-index: 30;
 }
+.skel-body { flex: 1 1 auto; overflow: auto; padding: 4px 0 8px; min-height: 0; }
+.skel-count { color: var(--gray-500); font-size: 11px; flex: 0 0 auto; }
+.skel-row {
+  display: flex; align-items: center; gap: 6px;
+  padding: 2px 8px 2px 0;
+  font: 400 12px/1.5 var(--font-mono);
+  color: var(--gray-300);
+  white-space: nowrap;
+}
+.skel-branch { cursor: pointer; }
+.skel-branch:hover { background: rgba(255, 255, 255, 0.06); }
+.skel-row .caret { font-size: 14px; width: 14px; color: var(--gray-500); flex: 0 0 auto; }
+.skel-idx { color: var(--gray-100); flex: 0 0 auto; }
+.skel-kids {
+  font: 600 10px/1 var(--font-mono);
+  color: var(--gray-300);
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 999px;
+  padding: 2px 5px;
+}
+.skel-pos { margin-left: auto; color: var(--gray-600); font-size: 10px; }
 /* Details always flush right (under/alongside Objects, never shifted inward) */
 .details-header {
   display: flex; align-items: center; gap: 8px;
   padding: 9px 10px 9px 12px;
-  border-bottom: 1px solid var(--ring);
 }
 .details-header > .icon { color: var(--accent); font-size: 18px; }
-.details-title { flex: 1 1 auto; font-weight: 600; }
+/* Panel titles read like the ANIMATION separator — uppercase, muted, spaced —
+   so every floating panel's header matches. The blue icon beside it stays. */
+.details-title, .plc-title, .wx-title {
+  flex: 1 1 auto;
+  color: var(--gray-500);
+  font: 600 11px/1.4 var(--font-ui);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
 .details-close { width: 24px; height: 24px; min-height: 0; background: transparent; border: none; box-shadow: none; }
 .details-close:hover { background: rgba(255, 255, 255, 0.1); }
 
@@ -830,10 +880,6 @@ body:has(#placements) #viewbar {
   z-index: 5;                 /* above the canvas, below the floating panels */
   display: flex; align-items: center; justify-content: center;
   padding-left: 348px;        /* clear the left panel */
-  /* Opaque: fully hides the 3D model behind it while a track is loaded. */
-  background:
-    radial-gradient(120% 120% at 50% 30%, rgba(77, 163, 255, 0.08), transparent 60%),
-    var(--gray-850);
 }
 .player-card {
   position: relative;
@@ -967,7 +1013,7 @@ body:has(#placements) #viewbar {
 .track-num { color: var(--gray-500); margin-left: auto; flex: 0 0 auto; }
 .node.selected .track-num { color: rgba(0, 0, 0, 0.5); }
 
-/* --- Headless UI: Listbox (animation picker) ------------------------------- */
+/* --- Headless UI: Listbox / Combobox (see src/Combo.jsx) ------------------- */
 
 .combo-input {
   display: flex; align-items: center; gap: 6px;
@@ -988,9 +1034,28 @@ body:has(#placements) #viewbar {
 .combo-value { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .combo-chevron { font-size: 16px; color: var(--muted); flex: 0 0 auto; }
 
+/* Filter variant: the value slot is a text field rather than a span. Selector
+   has to out-specify theme.css's input[type='text'], which would otherwise draw
+   its own bordered, inset-shadowed box inside the trigger. */
+.combo-input .combo-search {
+  font: inherit; color: inherit; cursor: text;
+  background: none; border: 0; border-radius: 0; box-shadow: none;
+  padding: 0; margin: 0; min-height: 0; outline: none;
+}
+.combo-input .combo-search::placeholder { color: var(--muted); opacity: 1; }
+.combo-input:focus-within { border-color: rgba(255, 255, 255, 0.28); }
+.combo-empty { color: var(--muted); font-size: 12px; padding: 6px 9px; }
+
 .combo-options {
-  width: var(--button-width);
-  min-width: 168px;
+  /* Grow to the widest row rather than tracking the trigger, so long gear names
+     stay on one line — but never end up narrower than what it dropped out of
+     (--combo-min-width is the trigger, measured in Combo.jsx). The cap needs
+     !important: the floating middleware writes its own inline max-width, the
+     full viewport. */
+  width: max-content;
+  min-width: max(var(--combo-min-width, 0px), 168px);
+  max-width: min(440px, calc(100vw - 24px)) !important;
+  scrollbar-gutter: stable;
   z-index: 300;
   margin-top: 4px;
   padding: 4px;
@@ -1010,6 +1075,7 @@ body:has(#placements) #viewbar {
   cursor: pointer;
   font-family: var(--font-mono);
   font-size: 12px;
+  white-space: nowrap;
 }
 .combo-option[data-focus] { background: rgba(255, 255, 255, 0.09); }
 .combo-option[data-selected] { color: var(--accent); font-weight: 600; }
@@ -1160,9 +1226,10 @@ body:has(#placements) #viewbar {
   font-size: 12.5px;
   line-height: 1.4;
   white-space: pre-wrap;
-  word-break: break-all;
+  overflow-wrap: anywhere;   /* wrap at spaces first; only split long paths */
 }
 .form-error > .icon { color: #e07068; font-size: 18px; flex: 0 0 auto; margin-top: 1px; }
+.form-error > span:not(.icon) { min-width: 0; }
 
 input[type='color'] {
   width: 42px; height: 30px;

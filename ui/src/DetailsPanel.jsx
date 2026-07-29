@@ -1,6 +1,6 @@
 import { useState } from 'react';
-import { Button, Listbox, ListboxButton, ListboxOption, ListboxOptions } from '@headlessui/react';
-import { cycleOnArrow } from './CharacterList.jsx';
+import { Button } from '@headlessui/react';
+import { Combo } from './Combo.jsx';
 
 const fmtDur = (frames, kfd) => {
   // Clip length in game-frames (30fps) → seconds.
@@ -19,7 +19,6 @@ export function DetailsPanel({ info, animClip, animId, schedule, onClose, onOpen
   const parts = info.parts ?? [];
   const part = partKey === 'all' ? null : parts.find((p) => p.key === partKey) ?? null;
   const shown = part ?? info;
-  const partIds = ['all', ...parts.map((p) => p.key)];
 
   return (
     <div id="details" className="panel">
@@ -34,25 +33,14 @@ export function DetailsPanel({ info, animClip, animId, schedule, onClose, onOpen
       <div className="details-body">
         {parts.length > 0 && (
           <div className="details-part-combo">
-            <Listbox value={partKey} onChange={setPartKey}>
-              {({ open }) => (
-                <div
-                  style={{ display: 'contents' }}
-                  onKeyDownCapture={(e) => cycleOnArrow(e, open, partIds, partKey, setPartKey)}
-                >
-                  <ListboxButton className="combo-input">
-                    <span className="combo-value">{part ? part.label : 'Character (merged)'}</span>
-                    <span className="icon combo-chevron">unfold_more</span>
-                  </ListboxButton>
-                  <ListboxOptions anchor="bottom start" className="combo-options">
-                    <ListboxOption value="all" className="combo-option">Character (merged)</ListboxOption>
-                    {parts.map((p) => (
-                      <ListboxOption key={p.key} value={p.key} className="combo-option">{p.label}</ListboxOption>
-                    ))}
-                  </ListboxOptions>
-                </div>
-              )}
-            </Listbox>
+            <Combo
+              value={partKey}
+              items={[
+                { id: 'all', label: 'Character (merged)' },
+                ...parts.map((p) => ({ id: p.key, label: p.label })),
+              ]}
+              onChange={setPartKey}
+            />
           </div>
         )}
 

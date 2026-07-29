@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react';
 import { Tooltip } from './Tooltip.jsx';
+import { listArrowHandler, useScrollIntoView } from './useListArrows.js';
 
 /**
  * The image sets inside the selected DAT — AltanaView's bottom list, moved to
@@ -50,30 +51,29 @@ export function ImageSetPanel({ file, sets = [], selected, onSelect, onClose }) 
             />
           </div>
 
-          <div className="plc-body">
+          <div
+            className="plc-body"
+            tabIndex={0}
+            onMouseDown={(e) => e.currentTarget.focus({ preventScroll: true })}
+            onKeyDown={listArrowHandler(
+              filtered,
+              filtered.findIndex((s) => selected && s.raw === selected.raw),
+              (s) => onSelect?.(s),
+            )}
+          >
             {!file && <div className="side-note">No image selected.</div>}
             {file && sets.length === 0 && <div className="side-note">No image sets in this file.</div>}
             {sets.length > 0 && filtered.length === 0 && (
               <div className="side-note">No matches for “{query}”.</div>
             )}
-            {filtered.map((s) => {
-              const sel = selected && selected.raw === s.raw;
-              return (
-                <div key={s.raw} className={`node${sel ? ' selected' : ''}`}>
-                  <div className="row" onClick={() => onSelect?.(s)} title={s.textureRef || s.raw}>
-                    <span className="caret icon" />
-                    <span className="kind icon">{s.texture ? 'image' : 'broken_image'}</span>
-                    <span className="img-cat mono-small">{s.category}</span>
-                    <span className="zone-name">{s.name}</span>
-                    {s.texture && (
-                      <span className="mono-small zone-id">
-                        {s.texture.width}×{s.texture.height}
-                      </span>
-                    )}
-                  </div>
-                </div>
-              );
-            })}
+            {filtered.map((s) => (
+              <SetRow
+                key={s.raw}
+                set={s}
+                selected={!!selected && selected.raw === s.raw}
+                onSelect={onSelect}
+              />
+            ))}
           </div>
 
           <div className="side-note plc-foot">
@@ -81,6 +81,25 @@ export function ImageSetPanel({ file, sets = [], selected, onSelect, onClose }) 
           </div>
         </>
       )}
+    </div>
+  );
+}
+
+function SetRow({ set: s, selected, onSelect }) {
+  const ref = useScrollIntoView(selected);
+  return (
+    <div className={`node${selected ? ' selected' : ''}`}>
+      <div className="row" ref={ref} onClick={() => onSelect?.(s)} title={s.textureRef || s.raw}>
+        <span className="caret icon" />
+        <span className="kind icon">{s.texture ? 'image' : 'broken_image'}</span>
+        <span className="img-cat mono-small">{s.category}</span>
+        <span className="zone-name">{s.name}</span>
+        {s.texture && (
+          <span className="mono-small zone-id">
+            {s.texture.width}×{s.texture.height}
+          </span>
+        )}
+      </div>
     </div>
   );
 }
