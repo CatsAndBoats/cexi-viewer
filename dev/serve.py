@@ -5,17 +5,61 @@ backend.js uses (list/read restricted to the FFXI game directory), so the
 viewer can be developed in a normal browser without the Tauri shell.
 
 Usage: python dev/serve.py [port]
+
+Env overrides — read from the environment, else the repo-root `.env`
+(see `.env.example`; `CEXI_ENV_FILE` points elsewhere), else the default shown:
+    CEXI_GAME_DIR   FFXI install dir  (D:\\cexi\\catseyexi-client\\Game\\FINAL FANTASY XI)
+    CEXI_VGMSTREAM  vgmstream-cli     (PATH lookup, then the AltanaListener install)
+    CEXI_CLI        cexi-tools exe    (PATH lookup, then C:\\Users\\Josh\\.local\\bin\\cexi.exe)
+    CEXI_DEV_HOST   bind address      (127.0.0.1)
+    CEXI_DEV_PORT   port when no argv port is given (8765)
 """
 import json
 import os
+import shutil
 import sys
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
-UI_DIR = Path(__file__).resolve().parent.parent / "ui"
+ROOT_DIR = Path(__file__).resolve().parent.parent
+
+
+def load_dotenv(path):
+    """Loads KEY=VALUE lines from `path` without overwriting real env vars.
+
+    Deliberately dependency-free (no python-dotenv): comments, blank lines, an
+    optional `export ` prefix and surrounding quotes are all this needs to
+    handle for .env.example-shaped files.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.removeprefix("export ").partition("=")
+        key, val = key.strip(), val.strip()
+        if not key.replace("_", "").isalnum() or key in os.environ:
+            continue
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
+            val = val[1:-1]
+        os.environ[key] = val
+
+
+load_dotenv(Path(os.environ.get("CEXI_ENV_FILE") or ROOT_DIR / ".env"))
+
+UI_DIR = ROOT_DIR / "ui"
 # CEXI_GAME_DIR overrides the install path (non-Windows dev boxes, alt clients).
 GAME_DIR = Path(os.environ.get("CEXI_GAME_DIR") or r"D:\cexi\catseyexi-client\Game\FINAL FANTASY XI")
+VGMSTREAM = (
+    os.environ.get("CEXI_VGMSTREAM")
+    or shutil.which("vgmstream-cli")
+    or r"D:\xidata\AltanaListener_Windows\Dependencies\vgmstream-cli.exe"
+)
+CEXI_CLI = os.environ.get("CEXI_CLI") or shutil.which("cexi") or r"C:\Users\Josh\.local\bin\cexi.exe"
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -36,7 +80,7 @@ class Handler(SimpleHTTPRequestHandler):
 
     def _vgmstream(self, raw):
         import subprocess, tempfile, os
-        vgm = r"D:\xidata\AltanaListener_Windows\Dependencies\vgmstream-cli.exe"
+        vgm = VGMSTREAM
         try:
             src = self._resolve(raw)
             out = os.path.join(tempfile.gettempdir(), "cexi_vgm_dev.wav")
@@ -58,7 +102,7 @@ class Handler(SimpleHTTPRequestHandler):
                 import subprocess, json as _json
                 length = int(self.headers.get("Content-Length", 0))
                 body = _json.loads(self.rfile.read(length))
-                cexi = body.get("cexiPath") or r"C:\Users\Josh\.local\bin\cexi.exe"
+                cexi = body.get("cexiPath") or CEXI_CLI
                 cmd = [cexi, "mesh", "export", body["datPath"], "--output", body["outputDir"], *body.get("args", [])]
                 r = subprocess.run(cmd, capture_output=True, text=True)
                 out = (r.stdout or "") + (r.stderr or "")
@@ -153,9 +197,10 @@ class Handler(SimpleHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8765
-    print(f"serving {UI_DIR} + game dir {GAME_DIR} on http://127.0.0.1:{port}")
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else int(os.environ.get("CEXI_DEV_PORT") or 8765)
+    host = os.environ.get("CEXI_DEV_HOST") or "127.0.0.1"
+    print(f"serving {UI_DIR} + game dir {GAME_DIR} on http://{host}:{port}")
     # Threaded: a zone load fires many overlapping reads, and listing the game
     # dir takes seconds. On the single-threaded server one slow request stalled
     # every other one and the loader appeared to hang.
-    ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
+    ThreadingHTTPServer((host, port), Handler).serve_forever()

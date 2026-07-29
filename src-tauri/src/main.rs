@@ -13,8 +13,20 @@ struct DirEntry {
     is_dir: bool,
 }
 
+/// The frontend joins paths Windows-style (`gamePath\ROM\1\58.DAT`); accept those
+/// on POSIX boxes, matching what dev/serve.py does. Backslash is a legal filename
+/// character on unix, but no FFXI DAT uses one.
+fn norm(path: &str) -> std::path::PathBuf {
+    if cfg!(windows) {
+        std::path::PathBuf::from(path)
+    } else {
+        std::path::PathBuf::from(path.replace('\\', "/"))
+    }
+}
+
 #[tauri::command]
 fn list_dir(path: String) -> Result<Vec<DirEntry>, String> {
+    let path = norm(&path);
     let mut out = Vec::new();
     for entry in std::fs::read_dir(&path).map_err(|e| e.to_string())? {
         let entry = entry.map_err(|e| e.to_string())?;
@@ -28,14 +40,15 @@ fn list_dir(path: String) -> Result<Vec<DirEntry>, String> {
 
 #[tauri::command]
 fn read_file(path: String) -> Result<tauri::ipc::Response, String> {
-    std::fs::read(&path)
+    std::fs::read(norm(&path))
         .map(tauri::ipc::Response::new)
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 fn write_file(path: String, contents: Vec<u8>) -> Result<(), String> {
-    if let Some(parent) = Path::new(&path).parent() {
+    let path = norm(&path);
+    if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     std::fs::write(&path, contents).map_err(|e| e.to_string())
@@ -52,6 +65,45 @@ fn pick_folder(initial: Option<String>) -> Option<String> {
     dialog
         .pick_folder()
         .map(|p| p.to_string_lossy().into_owned())
+}
+
+// ---------------------------------------------------------------------------
+// Machine-specific paths. Each default below is what shipped hardcoded; set the
+// matching env var to point the app elsewhere (non-Windows boxes, alt installs).
+//   CEXI_GAME_DIR   FFXI install directory
+//   CEXI_VGMSTREAM  vgmstream-cli executable
+//   CEXI_CLI        cexi-tools executable (or a folder containing it)
+//   CEXI_CACHE_DIR  where the embedded vgmstream is unpacked
+// ---------------------------------------------------------------------------
+const DEFAULT_GAME_DIR: &str = r"D:\cexi\catseyexi-client\Game\FINAL FANTASY XI";
+const DEFAULT_VGMSTREAM: &str = r"D:\xidata\AltanaListener_Windows\Dependencies\vgmstream-cli.exe";
+
+/// Loads `.env` so the overrides work when the app is launched directly (Finder,
+/// `cargo run`, a shortcut) and not just through start.sh / build.sh. Real
+/// environment variables are never overwritten; the first file found wins.
+/// Searched: `$CEXI_ENV_FILE`, the cwd and its parents, then next to the binary.
+fn load_dotenv() {
+    if let Some(f) = env_path("CEXI_ENV_FILE") {
+        if dotenvy::from_path(&f).is_ok() {
+            return;
+        }
+        eprintln!("CEXI_ENV_FILE set but unreadable: {}", f.display());
+    }
+    if dotenvy::dotenv().is_ok() {
+        return;
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let _ = dotenvy::from_path(dir.join(".env"));
+        }
+    }
+}
+
+/// Reads an env var, treating unset and blank as "not configured".
+fn env_path(name: &str) -> Option<std::path::PathBuf> {
+    let v = std::env::var(name).ok()?;
+    let v = v.trim();
+    (!v.is_empty()).then(|| std::path::PathBuf::from(v))
 }
 
 // vgmstream (ATRAC3 decoder) is embedded in the exe so the app is a single
@@ -76,11 +128,19 @@ const VGM_FILES: &[(&str, &[u8])] = &[
 /// Extracts the embedded vgmstream to %LOCALAPPDATA%\CexiViewerGL2\vgmstream on
 /// first run (or after a version bump) and returns the cli path.
 fn extract_vgmstream() -> Option<std::path::PathBuf> {
-    let base = std::env::var("LOCALAPPDATA")
-        .or_else(|_| std::env::var("APPDATA"))
-        .or_else(|_| std::env::var("TEMP"))
-        .ok()?;
-    let dir = std::path::PathBuf::from(base).join("CexiViewerGL2").join("vgmstream");
+    // CEXI_CACHE_DIR wins; otherwise the Windows locations, then the XDG/HOME
+    // cache on unix, then the system temp dir as a last resort.
+    let base = env_path("CEXI_CACHE_DIR").or_else(|| {
+        std::env::var("LOCALAPPDATA")
+            .or_else(|_| std::env::var("APPDATA"))
+            .or_else(|_| std::env::var("TEMP"))
+            .ok()
+            .map(std::path::PathBuf::from)
+            .or_else(|| env_path("XDG_CACHE_HOME"))
+            .or_else(|| env_path("HOME").map(|h| h.join(".cache")))
+            .or_else(|| Some(std::env::temp_dir()))
+    })?;
+    let dir = base.join("CexiViewerGL2").join("vgmstream");
     let cli = dir.join("vgmstream-cli.exe");
     let marker = dir.join(".version");
 
@@ -104,23 +164,36 @@ fn extract_vgmstream() -> Option<std::path::PathBuf> {
     cli.is_file().then_some(cli)
 }
 
-/// Locate vgmstream-cli.exe. Prefers a co-located `vgmstream` folder (dev), then
-/// the embedded copy extracted to the user cache, then the AltanaListener install.
+/// Locate vgmstream-cli. Order: CEXI_VGMSTREAM, a co-located `vgmstream` folder
+/// (dev), the embedded copy extracted to the user cache (Windows — the bundled
+/// build is win32), a `vgmstream-cli` on PATH, then the AltanaListener install.
 fn find_vgmstream() -> Option<std::path::PathBuf> {
+    if let Some(p) = env_path("CEXI_VGMSTREAM") {
+        if p.is_file() {
+            return Some(p);
+        }
+    }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let co = dir.join("vgmstream").join("vgmstream-cli.exe");
-            if co.is_file() {
-                return Some(co);
+            for name in ["vgmstream-cli.exe", "vgmstream-cli"] {
+                let co = dir.join("vgmstream").join(name);
+                if co.is_file() {
+                    return Some(co);
+                }
             }
         }
     }
-    if let Some(p) = extract_vgmstream() {
-        return Some(p);
+    if cfg!(windows) {
+        if let Some(p) = extract_vgmstream() {
+            return Some(p);
+        }
     }
-    let altana = std::path::PathBuf::from(
-        r"D:\xidata\AltanaListener_Windows\Dependencies\vgmstream-cli.exe",
-    );
+    for name in ["vgmstream-cli", "vgmstream-cli.exe"] {
+        if let Ok(p) = which_on_path(name) {
+            return Some(p);
+        }
+    }
+    let altana = std::path::PathBuf::from(DEFAULT_VGMSTREAM);
     altana.is_file().then_some(altana)
 }
 
@@ -135,7 +208,7 @@ fn decode_vgmstream(path: String) -> Result<tauri::ipc::Response, String> {
         .arg("-i")
         .arg("-o")
         .arg(&out)
-        .arg(&path)
+        .arg(norm(&path))
         .output()
         .map_err(|e| format!("failed to run vgmstream: {e}"))?;
 
@@ -149,22 +222,35 @@ fn decode_vgmstream(path: String) -> Result<tauri::ipc::Response, String> {
     Ok(tauri::ipc::Response::new(bytes))
 }
 
-/// Finds the `cexi` CLI (cexi-tools). Checks PATH, then the known install shim.
+/// Finds the `cexi` CLI (cexi-tools). Checks CEXI_CLI, then PATH, then the
+/// `~/.local/bin` install shim.
 fn find_cexi() -> Option<std::path::PathBuf> {
+    if let Some(p) = env_path("CEXI_CLI") {
+        if let Some(f) = cexi_in(&p) {
+            return Some(f);
+        }
+    }
     for name in ["cexi.exe", "cexi.cmd", "cexi.bat", "cexi"] {
         if let Ok(p) = which_on_path(name) {
             return Some(p);
         }
     }
-    let home = std::env::var("USERPROFILE").ok()?;
-    for cand in [
-        format!(r"{home}\.local\bin\cexi.exe"),
-        format!(r"{home}\.local\bin\cexi.cmd"),
-        format!(r"{home}\.local\bin\cexi"),
-    ] {
-        let p = std::path::PathBuf::from(cand);
-        if p.is_file() {
-            return Some(p);
+    let home = env_path("USERPROFILE").or_else(|| env_path("HOME"))?;
+    cexi_in(&home.join(".local").join("bin"))
+}
+
+/// Resolves `p` to a runnable cexi: `p` itself if it's a file, else the first
+/// cexi variant inside it if it's a folder.
+fn cexi_in(p: &Path) -> Option<std::path::PathBuf> {
+    if p.is_file() {
+        return Some(p.to_path_buf());
+    }
+    if p.is_dir() {
+        for n in ["cexi.exe", "cexi.cmd", "cexi.bat", "cexi"] {
+            let f = p.join(n);
+            if f.is_file() {
+                return Some(f);
+            }
         }
     }
     None
@@ -186,17 +272,8 @@ fn which_on_path(name: &str) -> Result<std::path::PathBuf, ()> {
 fn resolve_cexi(configured: &Option<String>) -> Option<std::path::PathBuf> {
     if let Some(c) = configured {
         if !c.trim().is_empty() {
-            let p = std::path::PathBuf::from(c.trim());
-            if p.is_file() {
-                return Some(p);
-            }
-            if p.is_dir() {
-                for n in ["cexi.exe", "cexi.cmd", "cexi.bat", "cexi"] {
-                    let f = p.join(n);
-                    if f.is_file() {
-                        return Some(f);
-                    }
-                }
+            if let Some(f) = cexi_in(Path::new(c.trim())) {
+                return Some(f);
             }
         }
     }
@@ -233,7 +310,11 @@ fn cexi_mesh_export(
     let cexi = resolve_cexi(&cexi_path)
         .ok_or("cexi CLI not found — set the cexi-tools path in Settings")?;
     let mut cmd = std::process::Command::new(&cexi);
-    cmd.arg("mesh").arg("export").arg(&dat_path).arg("--output").arg(&output_dir);
+    cmd.arg("mesh")
+        .arg("export")
+        .arg(norm(&dat_path))
+        .arg("--output")
+        .arg(norm(&output_dir));
     for a in &args {
         cmd.arg(a);
     }
@@ -249,9 +330,13 @@ fn cexi_mesh_export(
 
 #[tauri::command]
 fn default_game_path() -> String {
-    let p = r"D:\cexi\catseyexi-client\Game\FINAL FANTASY XI";
-    if Path::new(p).exists() {
-        p.to_string()
+    // CEXI_GAME_DIR is returned as-is so a mistyped override is visible in the
+    // UI rather than silently falling back to the Windows default.
+    if let Some(p) = env_path("CEXI_GAME_DIR") {
+        return p.to_string_lossy().into_owned();
+    }
+    if Path::new(DEFAULT_GAME_DIR).exists() {
+        DEFAULT_GAME_DIR.to_string()
     } else {
         String::new()
     }
@@ -267,7 +352,97 @@ fn open_url(url: String) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // One test: these all mutate process-wide env, so they must not run in
+    // parallel with each other.
+    #[test]
+    fn env_overrides_win_over_hardcoded_defaults() {
+        assert!(env_path("CEXI_DEFINITELY_UNSET_VAR").is_none());
+
+        std::env::set_var("CEXI_GAME_DIR", "   ");
+        assert!(env_path("CEXI_GAME_DIR").is_none(), "blank must count as unset");
+
+        std::env::set_var("CEXI_GAME_DIR", "/tmp/fake-ffxi");
+        assert_eq!(default_game_path(), "/tmp/fake-ffxi");
+
+        std::env::remove_var("CEXI_GAME_DIR");
+        let fallback = default_game_path();
+        assert!(fallback.is_empty() || fallback == DEFAULT_GAME_DIR);
+
+        // A non-existent override is ignored so the normal search still runs.
+        std::env::set_var("CEXI_VGMSTREAM", "/tmp/definitely-not-here/vgmstream-cli");
+        assert_ne!(
+            find_vgmstream().as_deref(),
+            Some(Path::new("/tmp/definitely-not-here/vgmstream-cli"))
+        );
+        std::env::remove_var("CEXI_VGMSTREAM");
+
+        // CEXI_CLI accepts a folder as well as a file.
+        let dir = std::env::temp_dir().join("cexi_cli_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let shim = dir.join("cexi");
+        std::fs::write(&shim, b"#!/bin/sh\n").unwrap();
+        std::env::set_var("CEXI_CLI", &dir);
+        assert_eq!(find_cexi(), Some(shim));
+        std::env::remove_var("CEXI_CLI");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The file tree sends `<gamePath>\ROM\1`, so listing must work with either
+    /// separator on unix. Runs against the real install when CEXI_GAME_DIR (or
+    /// .env) points at one; otherwise a temp dir stands in.
+    #[test]
+    fn list_dir_accepts_windows_style_separators() {
+        load_dotenv();
+        let (root, sub) = match env_path("CEXI_GAME_DIR").filter(|p| p.join("ROM").is_dir()) {
+            Some(game) => (game, "ROM"),
+            None => {
+                let tmp = std::env::temp_dir().join("cexi_norm_test");
+                std::fs::create_dir_all(tmp.join("ROM")).unwrap();
+                (tmp, "ROM")
+            }
+        };
+
+        let backslashed = format!("{}\\{sub}", root.display());
+        let listed = list_dir(backslashed.clone())
+            .unwrap_or_else(|e| panic!("failed to list {backslashed}: {e}"));
+        let forward = list_dir(root.join(sub).display().to_string()).unwrap();
+        assert_eq!(listed.len(), forward.len());
+    }
+
+    #[test]
+    fn dotenv_fills_gaps_but_never_overwrites_the_environment() {
+        let f = std::env::temp_dir().join("cexi_dotenv_test.env");
+        std::fs::write(
+            &f,
+            "# comment\n\nCEXI_TEST_FROM_FILE=/tmp/from-file\nexport CEXI_TEST_QUOTED=\"/tmp/quoted\"\nCEXI_TEST_PRESET=/tmp/from-file\n",
+        )
+        .unwrap();
+
+        std::env::set_var("CEXI_TEST_PRESET", "/tmp/from-env");
+        std::env::set_var("CEXI_ENV_FILE", &f);
+        load_dotenv();
+
+        assert_eq!(env_path("CEXI_TEST_FROM_FILE").unwrap().to_str(), Some("/tmp/from-file"));
+        assert_eq!(env_path("CEXI_TEST_QUOTED").unwrap().to_str(), Some("/tmp/quoted"));
+        assert_eq!(
+            env_path("CEXI_TEST_PRESET").unwrap().to_str(),
+            Some("/tmp/from-env"),
+            "a real env var must beat the .env file"
+        );
+
+        for k in ["CEXI_ENV_FILE", "CEXI_TEST_FROM_FILE", "CEXI_TEST_QUOTED", "CEXI_TEST_PRESET"] {
+            std::env::remove_var(k);
+        }
+        let _ = std::fs::remove_file(&f);
+    }
+}
+
 fn main() {
+    load_dotenv();
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             list_dir,

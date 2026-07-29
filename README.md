@@ -31,7 +31,15 @@ Get the latest release by going to: [Github Releases](https://github.com/CatsAnd
 Requires Rust (no Node needed):
 
 ```
-Start.bat
+Start.bat          (Windows)
+./start.sh         (macOS / Linux)
+```
+
+Release build (embeds the Vite frontend, standalone binary):
+
+```
+Build.bat          (Windows)
+./build.sh         (macOS / Linux — pass --bundle for a .dmg/.AppImage)
 ```
 
 or:
@@ -53,3 +61,39 @@ python dev/serve.py 8766
 
 then open http://localhost:8766. `window.cexi` exposes the renderer for
 debugging.
+
+## Environment variables
+
+Machine-specific paths default to the original hardcoded Windows values; set the
+matching variable to override one. Unset or blank means "use the default".
+
+Copy `.env.example` to `.env` (git-ignored) to set them persistently:
+
+```
+cp .env.example .env
+```
+
+The repo-root `.env` is read by `start.sh`, `build.sh`, the Tauri app itself,
+`dev/serve.py` and `vite.config.js` — so it applies however the app is launched.
+A real environment variable always beats the file, so one-offs still work:
+`CEXI_GAME_DIR="$HOME/FFXI" ./start.sh`. `CEXI_ENV_FILE` points at a different
+file; the app also falls back to a `.env` next to the binary (Finder / shortcut
+launches, where the working directory isn't the repo).
+
+| Variable | Overrides | Default |
+|---|---|---|
+| `CEXI_GAME_DIR` | FFXI install dir | `D:\cexi\catseyexi-client\Game\FINAL FANTASY XI` |
+| `CEXI_VGMSTREAM` | `vgmstream-cli` (BGW/SPW audio decode) | co-located `vgmstream/` → embedded copy (Windows) → PATH → `D:\xidata\AltanaListener_Windows\Dependencies\vgmstream-cli.exe` |
+| `CEXI_CLI` | `cexi` (cexi-tools) executable, or a folder holding it | Settings value → PATH → `~/.local/bin/cexi` |
+| `CEXI_CACHE_DIR` | where the embedded vgmstream is unpacked | `%LOCALAPPDATA%` → `$XDG_CACHE_HOME` → `~/.cache` → temp, all `+ /CexiViewerGL2/vgmstream` |
+| `CEXI_DEV_HOST` / `CEXI_DEV_PORT` | `dev/serve.py` bind address / port (a port argv still wins) | `127.0.0.1` / `8765` |
+| `CEXI_FS_PROXY` | where Vite proxies `/fs` in browser dev mode | `http://127.0.0.1:8766` |
+| `CEXI_ENV_FILE` | which `.env` file to read | repo-root `.env`, then a `.env` beside the binary |
+
+```
+CEXI_GAME_DIR="$HOME/FFXI" ./start.sh
+```
+
+Note: `CEXI_GAME_DIR` supplies the *default* only. A game path already saved in
+Settings (`localStorage.gamePath`) still wins — clear it to pick the env value
+back up.
