@@ -45,7 +45,6 @@ jobs:
 
           echo "version=${version}"                                >> "$GITHUB_OUTPUT"
           echo "tag_name=${tag_name}"                              >> "$GITHUB_OUTPUT"
-          echo "zip_name=cexi-model-viewer-${tag_name}.zip"        >> "$GITHUB_OUTPUT"
 
       - name: Stamp version into the app
         shell: pwsh
@@ -112,7 +111,12 @@ jobs:
         working-directory: src-tauri
         run: npx --yes @tauri-apps/cli@^2 build --no-bundle
 
-      - name: Stage release contents
+      # The exe ships on its own. vgmstream is compiled into it (include_bytes! in
+      # src-tauri/src/main.rs) and unpacks itself to %LOCALAPPDATA%\CexiViewerGL2
+      # on first use, so nothing needs to sit next to it -- and find_vgmstream()
+      # prefers a co-located vgmstream/ folder over the embedded copy, so shipping
+      # one would only shadow the self-extracting path.
+      - name: Verify build output
         id: stage
         shell: pwsh
         run: |
@@ -120,32 +124,16 @@ jobs:
           $exe = 'src-tauri/target/release/cexi-model-viewer.exe'
           if (-not (Test-Path $exe)) { throw "Build did not produce $exe" }
 
-          $staging = 'dist/staging'
-          New-Item -ItemType Directory -Force -Path $staging | Out-Null
-          Copy-Item $exe $staging
-
-          # vgmstream is embedded in the exe, but Build.bat also drops it alongside
-          # so the app can shell out to it directly. Ship the same layout.
-          if (Test-Path 'src-tauri/vgmstream') {
-            Copy-Item 'src-tauri/vgmstream' (Join-Path $staging 'vgmstream') -Recurse
-          }
-          foreach ($f in 'README.md', 'LICENSE') {
-            if (Test-Path $f) { Copy-Item $f $staging }
-          }
-
-          $zip = 'dist/${{ steps.release.outputs.zip_name }}'
-          Compress-Archive -Path (Join-Path $staging '*') -DestinationPath $zip -Force
-
-          $size = (Get-Item $zip).Length
-          "zip_path=$zip"       >> $env:GITHUB_OUTPUT
-          "zip_bytes=$size"     >> $env:GITHUB_OUTPUT
-          Write-Host "Packaged $zip ($([math]::Round($size / 1MB, 1)) MB)"
+          $size = (Get-Item $exe).Length
+          "exe_path=$exe"   >> $env:GITHUB_OUTPUT
+          "exe_bytes=$size" >> $env:GITHUB_OUTPUT
+          Write-Host "Built $exe ($([math]::Round($size / 1MB, 1)) MB)"
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
           name: cexi-viewer-release
-          path: ${{ steps.stage.outputs.zip_path }}
+          path: ${{ steps.stage.outputs.exe_path }}
           if-no-files-found: error
 
       - name: Create GitHub Release
@@ -153,7 +141,7 @@ jobs:
         with:
           tag_name: ${{ steps.release.outputs.tag_name }}
           name: CEXI Model Viewer v${{ steps.release.outputs.version }}
-          files: ${{ steps.stage.outputs.zip_path }}
+          files: ${{ steps.stage.outputs.exe_path }}
           generate_release_notes: true
           fail_on_unmatched_files: true
 
@@ -162,7 +150,7 @@ jobs:
         shell: bash
         run: |
           release_url="${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ steps.release.outputs.tag_name }}"
-          bytes="${{ steps.stage.outputs.zip_bytes }}"
+          bytes="${{ steps.stage.outputs.exe_bytes }}"
           {
             echo "## CEXI Model Viewer v${{ steps.release.outputs.version }}"
             echo ""
@@ -173,7 +161,7 @@ jobs:
             echo "| Trigger | \`${{ github.event_name }}\` |"
             echo "| Commit | \`${{ github.sha }}\` |"
             if [[ -n "$bytes" ]]; then
-              echo "| Asset | \`${{ steps.release.outputs.zip_name }}\` ($((bytes / 1048576)) MB) |"
+              echo "| Asset | \`cexi-model-viewer.exe\` ($((bytes / 1048576)) MB) |"
             else
               echo "| Asset | _not built_ |"
             fi
