@@ -5,6 +5,17 @@ import { backend } from '../js/backend.js';
 const GITHUB = 'https://github.com/CatsAndBoats/model-viewer';
 const DISCORD = 'https://discord.gg/catseyexi';
 
+const GENERAL_CONTROLS = [
+  ['Left Mouse', 'Rotate'],
+  ['Right Mouse', 'Pan'],
+  ['Wheel', 'Zoom'],
+];
+const ZONE_CONTROLS = [
+  ['WASD', 'Move around'],
+  ['Q / E', 'Up and Down'],
+  ['Wheel', 'Move speed'],
+];
+
 const openLink = (e, url) => {
   e.preventDefault();
   backend.openUrl(url);
@@ -69,6 +80,27 @@ export function HelpModal({ open, onClose }) {
           <div className="help-badges">
             <span className="help-badge">Built by Vekien</span>
             <span className="help-badge">AI Assisted Dev</span>
+          </div>
+
+          <div className="help-controls">
+            <div className="help-controls-group">
+              <div className="help-controls-title">General Assets</div>
+              {GENERAL_CONTROLS.map(([keys, action]) => (
+                <div className="help-key-row" key={action}>
+                  <span className="help-keys">{keys}</span>
+                  <span className="help-action">{action}</span>
+                </div>
+              ))}
+            </div>
+            <div className="help-controls-group">
+              <div className="help-controls-title">Zones</div>
+              {ZONE_CONTROLS.map(([keys, action]) => (
+                <div className="help-key-row" key={action}>
+                  <span className="help-keys">{keys}</span>
+                  <span className="help-action">{action}</span>
+                </div>
+              ))}
+            </div>
           </div>
 
           <div className="help-links">

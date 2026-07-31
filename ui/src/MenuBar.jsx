@@ -27,6 +27,8 @@ const MENUS = [
       { id: 'toggle-navmesh', label: 'Toggle Navmesh', icon: 'polyline', check: 'navmesh', disableWhen: 'noNavmesh' },
       { id: 'toggle-skybox', label: 'Toggle Skybox', icon: 'cloud', check: 'skybox', disableWhen: 'noSkybox' },
       { id: 'toggle-effects', label: 'Toggle Effects', icon: 'auto_awesome', check: 'effects' },
+      { id: 'toggle-axes', label: 'Toggle Axes', icon: 'open_with', check: 'axes' },
+      { id: 'toggle-grid', label: 'Toggle Grid', icon: 'grid_4x4', check: 'grid' },
     ],
   },
   {
@@ -39,7 +41,7 @@ const MENUS = [
       { id: 'assets-zones', label: 'Zones', icon: 'map' },
       { id: 'assets-npcs', label: 'NPCs', icon: 'pets' },
       { id: 'assets-characters', label: 'Characters', icon: 'person' },
-      { id: 'assets-effects', label: 'Effects', icon: 'auto_awesome', disabled: true },
+      { id: 'assets-effects', label: 'Effects', icon: 'auto_awesome' },
       { id: 'assets-music', label: 'Music', icon: 'music_note' },
       { id: 'assets-sfx', label: 'Sound FX', icon: 'graphic_eq' },
     ],

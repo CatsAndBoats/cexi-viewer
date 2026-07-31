@@ -31,6 +31,8 @@ import { buildDatTree, SEC } from '../js/dat/tree.js';
 import { makeParsers } from '../js/dat/sections.js';
 import { parseParticleGenerator } from '../js/particle/parser.js';
 import { ParticleSystem } from '../js/particle/system.js';
+import { parseEffectRoutines, flattenRoutine } from '../js/effect.js';
+import { EffectList } from './EffectList.jsx';
 import { WeatherAudio } from '../js/particle/audio.js';
 import { toAudioBuffer, parseAudioHeader, FMT_ATRAC3 } from '../js/audio.js';
 import { parseImageDat, textureForSet } from '../js/images.js';
@@ -47,9 +49,11 @@ const LAST_DAT_KEY = 'lastDat';
 const LAST_VIEW_KEY = 'lastView';
 const LAST_IMAGE_KEY = 'lastImage';
 const ANIM_SEL_KEY = 'lastAnimSel';
-const VIEWS = ['files', 'npc', 'pc', 'music', 'sfx', 'scene', 'zones', 'images'];
+const VIEWS = ['files', 'npc', 'pc', 'music', 'sfx', 'scene', 'zones', 'images', 'effects'];
 /** Views that browse individual models, where fly controls are a hindrance. */
 const ORBIT_VIEWS = new Set(['files', 'npc', 'pc']);
+/** Views with a Details panel — model/zone stats, or an effect's sprite images. */
+const DETAIL_VIEWS = new Set([...ORBIT_VIEWS, 'effects']);
 // Zones and Scene are two panels onto the same loaded zone, so moving between
 // them keeps it. Every other view change is a fresh page: whatever the last one
 // had running gets torn down.
@@ -104,6 +108,28 @@ const loadSettings = (gamePath) => ({
   cexiPath: localStorage.getItem('cexiPath') || '',
 });
 
+// Particle-DAT parsers/tree, shared by zone effects and standalone spell/ability
+// DATs so both resolve links (meshes, keyframes, sprites) the same way. Effect
+// DATs are static resources (zoneResource false — no x2 vertex-colour scale).
+function particleParsers(zoneResource, warnings) {
+  return makeParsers(
+    { [SEC.EFFECT]: (b, d, s, e) => parseParticleGenerator(b, d, s, e, (m) => warnings.push(m)) },
+    zoneResource,
+  );
+}
+/**
+ * DAT texture names are a 16-byte field holding an 8-byte group plus an 8-byte
+ * name ("lvup    lvu1"); the trailing token is the texture's own id. Display
+ * only — the raw name stays the lookup key.
+ */
+const texLabel = (name) => String(name ?? '').trim().split(/\s+/).pop() || String(name ?? '');
+
+function buildParticleTree(buffer, parsers, warnings) {
+  const bytes = new Uint8Array(buffer);
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  return buildDatTree(bytes, dv, parseSections(dv), parsers, (m) => warnings.push(m));
+}
+
 export default function App() {
   const canvasRef = useRef(null);
   const rendererRef = useRef(null);
@@ -135,7 +161,16 @@ export default function App() {
   }, []);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsError, setSettingsError] = useState('');
-  const [helpOpen, setHelpOpen] = useState(false);
+  // Greet first-time users with the About panel (controls + links), then never
+  // auto-open it again. A missing/false 'booted' flag means this install has
+  // never launched before.
+  const [helpOpen, setHelpOpen] = useState(() => {
+    const firstBoot = localStorage.getItem('booted') !== '1';
+    if (firstBoot) {
+      try { localStorage.setItem('booted', '1'); } catch { /* quota */ }
+    }
+    return firstBoot;
+  });
   const [exportSpec, setExportSpec] = useState(null);
   const [leftView, setLeftViewState] = useState(() => {
     const v = localStorage.getItem(LAST_VIEW_KEY);
@@ -197,6 +232,12 @@ export default function App() {
   const animTick = useRef(null);
   const [showTex, setShowTex] = useState(true);
   const [showWireframe, setShowWireframe] = useState(false);
+  // Origin axis gizmo. Defaults on in Effects (particles play at 0,0,0 with no
+  // other geometry to judge position against) and off everywhere else; the
+  // view-change effect below re-applies that default on every switch.
+  const [showAxes, setShowAxes] = useState(() => localStorage.getItem(LAST_VIEW_KEY) === 'effects');
+  // World grid (the floor, as lines). Off until asked for; sticks across views.
+  const [showGrid, setShowGrid] = useState(false);
   const [showSkeleton, setShowSkeleton] = useState(false);
   const [showAlpha, setShowAlpha] = useState(true);
   const [showUnlit, setShowUnlit] = useState(false);
@@ -229,6 +270,22 @@ export default function App() {
   const zoneEnvManagerRef = useRef(null);                   // EnvironmentManager (clock + weather fades)
   const globalEffectsRef = useRef(null);                    // ROM/0/0.DAT shared effects tree
   const weatherAudioRef = useRef(null);                     // ambient weather bed (0x3D sound pointers)
+
+  // ── Assets > Effects (standalone spell/ability VFX) ────────────────────────
+  const [effectEntry, setEffectEntry] = useState(null);     // { name, dir, file, path } | null
+  const [effectRoutines, setEffectRoutines] = useState([]); // 0x07 routines in the effect DAT
+  const [effectSchedule, setEffectSchedule] = useState(''); // active routine id (AltanaViewer "Schedule")
+  const [effectPlaying, setEffectPlaying] = useState(true);
+  const [effectSpeed, setEffectSpeedState] = useState(1);
+  const effectRoutinesRef = useRef([]);                     // mirror for stable playback callbacks
+  const effectSpeedRef = useRef(1);
+  const [effectVolume, setEffectVolumeState] = useState(() => {
+    const v = parseFloat(localStorage.getItem('effectVolume'));
+    return Number.isFinite(v) ? Math.min(1, Math.max(0, v)) : 0.6;
+  });
+  const effectVolumeRef = useRef(effectVolume);
+  const effectSfxOnRef = useRef(true);
+  const effectTokenRef = useRef(0);                         // drop stale effect-load results
   const zoneMusicRef = useRef(null);                        // zone_music.json (server zone_settings)
   const zoneMusicIdRef = useRef(null);                      // zone id of the loaded zone
   const [zoneTrack, setZoneTrackState] = useState(null);    // resolved BGM for this zone + time
@@ -300,7 +357,8 @@ export default function App() {
         // Speed still shows live in the camera-settings readout; no status-bar spam.
         renderer.camera.adjustFlySpeed(e.deltaY < 0 ? 1 : -1);
       } else {
-        renderer.camera.zoom(-Math.sign(e.deltaY) * 120);
+        // Anchored at the cursor: zooming dives toward what you point at.
+        renderer.zoomAt(e.clientX, e.clientY, -Math.sign(e.deltaY) * 120);
       }
     };
     canvas.addEventListener('wheel', onWheel, { passive: false });
@@ -312,6 +370,11 @@ export default function App() {
     const onKeyDown = (e) => {
       if (isTyping(e.target)) return;
       const k = e.key.toLowerCase();
+      if (k === 'f') {
+        rendererRef.current?.resetCamera();
+        e.preventDefault();
+        return;
+      }
       if (k === 'w' || k === 'a' || k === 's' || k === 'd' || k === 'q' || k === 'e') {
         if (wasdRef.current) {
           heldKeys.current.add(k);
@@ -347,6 +410,14 @@ export default function App() {
   useEffect(() => {
     if (rendererRef.current) rendererRef.current.showWireframe = showWireframe;
   }, [showWireframe]);
+
+  useEffect(() => {
+    if (rendererRef.current) rendererRef.current.showAxes = showAxes;
+  }, [showAxes]);
+
+  useEffect(() => {
+    if (rendererRef.current) rendererRef.current.showGrid = showGrid;
+  }, [showGrid]);
 
   useEffect(() => {
     if (rendererRef.current) rendererRef.current.showSkeleton = showSkeleton;
@@ -705,6 +776,229 @@ export default function App() {
     return system;
   }, []);
 
+  // ── Assets > Effects ───────────────────────────────────────────────────────
+
+  /** Load ROM/0/0.DAT once — the shared effects tree spell DATs link into. */
+  const ensureGlobalEffects = useCallback(async (gamePath, warnings) => {
+    if (globalEffectsRef.current) return globalEffectsRef.current;
+    try {
+      const buf = await backend.readFile(`${gamePath}\\ROM\\0\\0.DAT`);
+      globalEffectsRef.current = {
+        root: buildParticleTree(buf, particleParsers(false, warnings), warnings),
+        textures: parseDatTextures(buf),
+        // Shared routines (mdam, stnm, dada, …) that effect routines invoke by
+        // name through their 0x03 commands.
+        routines: new Map(parseEffectRoutines(buf).map((r) => [r.id, r])),
+      };
+    } catch (e) {
+      console.warn('shared effects DAT (ROM/0/0.DAT) unavailable', e);
+      globalEffectsRef.current = { root: null, textures: new Map(), routines: new Map() };
+    }
+    return globalEffectsRef.current;
+  }, []);
+
+  /**
+   * Load and play a standalone spell/ability effect on the empty stage. The DAT
+   * is a directory of 0x05 generators plus a 0x07 routine timeline; we build its
+   * particle tree, arm the routine, and hand the system to the renderer, which
+   * draws the particles at the world origin (no actor rig — see effect.js).
+   */
+  const loadEffect = useCallback(async (entry) => {
+    const gamePath = settingsRef.current?.gamePath;
+    if (!gamePath) { setStatusText('Set a game path in Settings first.'); return; }
+    const rel = entry.path.replace(/\//g, '\\');
+    const abs = `${gamePath}\\${rel}`;
+    const token = ++effectTokenRef.current;
+    // Silence the outgoing effect on the click, not when the new one finishes
+    // loading — reading and parsing the DAT takes long enough that the old
+    // sounds would otherwise carry on over the new selection. Also covers a
+    // load that fails or gets superseded before it can attach.
+    weatherAudioRef.current?.stopOneShots();
+    rendererRef.current?.particleSystem?.clearEffect();
+    setStatusText(`Loading ${entry.name}…`);
+
+    try {
+      const buf = await backend.readFile(abs);
+      const parsed = parseEffectRoutines(buf);
+      const warnings = [];
+      await ensureGlobalEffects(gamePath, warnings);
+      if (token !== effectTokenRef.current) return;   // superseded by a newer click
+
+      // Expand each routine's 0x03 calls now, so picking one from the Schedule
+      // combo is just a lookup. A `main` that spawns nothing itself usually
+      // delegates to another routine (Cure: main → tgt0) — see flattenRoutine.
+      const byId = new Map(parsed.map((r) => [r.id, r]));
+      const globalById = globalEffectsRef.current?.routines ?? null;
+      const routines = parsed.map((r) => ({ ...r, flat: flattenRoutine(r, byId, globalById) }));
+
+      const tree = buildParticleTree(buf, particleParsers(false, warnings), warnings);
+      // The effect's own images; the shared ROM/0/0.DAT set is merged in for
+      // rendering (links reach into it) but kept out of the Details listing,
+      // which should show what *this* effect ships.
+      const ownTextures = parseDatTextures(buf);
+      const textures = new Map(ownTextures);
+      for (const [name, tex] of globalEffectsRef.current?.textures ?? []) {
+        if (!textures.has(name)) textures.set(name, tex);
+      }
+
+      const system = new ParticleSystem({
+        zoneRoot: tree,
+        globalRoot: globalEffectsRef.current?.root ?? null,
+        camera: null,
+        environment: null,
+        onWarn: (m) => console.debug('[effect]', m),
+      });
+      // `main` is the entry point and must win, even when it isn't first in DAT
+      // order — Banishga V declares sub1, main, sub2, so picking "first routine
+      // with content" played sub1: half the generators and none of the sounds.
+      // Only fall back to another routine when main genuinely plays nothing.
+      const playable = (r) => r && r.flat.commands.length > 0;
+      const named = routines.find((r) => r.id === 'main');
+      const routine = (playable(named) ? named : null)
+        ?? routines.find(playable)
+        ?? routines[0]
+        ?? { id: 'main', flat: { commands: [], sounds: [] } };
+
+      // Particle- and routine-driven SFX. WeatherAudio's play() is a generic
+      // sound-pointer backend; passing no environment keeps its ambient bed out
+      // of it, leaving just the effect's own one-shots.
+      const audio = getWeatherAudio();
+      audio.attach(system, null);
+      audio.setEnabled(effectSfxOnRef.current);
+      audio.setVolume(effectVolumeRef.current);
+
+      // Decode every scheduled sound BEFORE arming the routine — a cold first
+      // play pays read + decode at fire time and lands audibly late no matter
+      // how right the schedule is. All routines' sounds, so switching Schedule
+      // stays warm too.
+      const warmIds = new Set();
+      for (const r of routines) {
+        for (const s of r.flat.sounds) {
+          const ptr = system.areaRoot?.getChildRecursive(s.soundId, SEC.SOUND_POINTER)
+            ?? system.globalRoot?.getChildRecursive(s.soundId, SEC.SOUND_POINTER);
+          if (ptr) warmIds.add(ptr.soundId);
+        }
+      }
+      if (warmIds.size && effectSfxOnRef.current) {
+        await Promise.all([...warmIds].map((id) => audio.warm(id)));
+        if (token !== effectTokenRef.current) return;
+      }
+
+      system.playEffectRoutine(routine.flat.commands, { loop: true, sounds: routine.flat.sounds });
+
+      const renderer = rendererRef.current;
+      setWasd(false);                    // effects orbit; fly controls would fight the framing
+      // Already showing an effect? Keep the orbit — only frame the first one so
+      // switching effects doesn't yank the camera back each time.
+      const keepCamera = renderer.effectMode;
+      renderer.setEffectScene(system, textures, keepCamera);
+      renderer.effectSpeed = effectSpeedRef.current;
+      renderer.effectPaused = false;
+
+      modelRef.current = null;
+      effectRoutinesRef.current = routines;
+      setEffectEntry(entry);
+      setEffectRoutines(routines);
+      setEffectSchedule(routine.id);
+      setEffectPlaying(true);
+      setModelPath(rel);
+      setSelectedDat(abs.toLowerCase());
+      shownPathRef.current = abs;
+
+      // Details panel: the effect's sprite images (click to view, same as gear
+      // textures) plus what the DAT actually contains.
+      const dir = tree.getSubDirectories()[0] ?? tree;
+      const sheets = dir.collectByTypeRecursive(SEC.SPRITE_SHEET);
+      const pmeshes = dir.collectByTypeRecursive(SEC.PARTICLE_MESH);
+      const countVerts = (list) => list.reduce(
+        (n, r) => n + (r.meshes ?? []).reduce((m, x) => m + (x.count ?? 0), 0), 0,
+      );
+      const verts = countVerts(sheets) + countVerts(pmeshes);
+      setTexWindows([]);   // close viewers from the previous effect
+      setModelInfo({
+        name: entry.name,
+        joints: null,
+        verts,
+        tris: Math.floor(verts / 3),
+        animCount: 0,
+        scheduleCount: routines.length,
+        textures: [...ownTextures.values()].map((t) => ({
+          name: texLabel(t.name), width: t.width, height: t.height, format: t.format, data: t.data,
+        })),
+        parts: [],
+        effect: {
+          path: rel,
+          category: entry.cat ?? '—',
+          generators: routine.flat.commands.length,
+          sounds: routine.flat.sounds.length,
+          spriteSheets: sheets.length,
+          particleMeshes: pmeshes.length,
+        },
+      });
+      setStatusText(
+        routine.flat.commands.length
+          ? `${entry.name}  ·  ${routine.flat.commands.length} generators`
+          : `${entry.name}  ·  no particle routine`,
+      );
+    } catch (e) {
+      console.warn('[effect] load failed', abs, e);
+      if (token === effectTokenRef.current) {
+        setStatusText(`Effect load failed: ${e.message || e || 'unknown error'}`);
+      }
+    }
+    // getWeatherAudio is declared below this callback, so it can't go in the
+    // dependency array without tripping the temporal dead zone. It's a
+    // useCallback with no deps — stable for the life of the component — so the
+    // captured reference is always the right one.
+  }, [ensureGlobalEffects, setWasd]);
+
+  /** Effect SFX level. 0 mutes: the backend stops rather than playing silence. */
+  const setEffectVolume = useCallback((v) => {
+    const clamped = Math.min(1, Math.max(0, v));
+    effectVolumeRef.current = clamped;
+    effectSfxOnRef.current = clamped > 0;
+    setEffectVolumeState(clamped);
+    try { localStorage.setItem('effectVolume', String(clamped)); } catch { /* quota */ }
+    const audio = weatherAudioRef.current;
+    if (!audio) return;
+    audio.setVolume(clamped);
+    audio.setEnabled(clamped > 0);
+  }, []);
+
+  const setEffectSpeed = useCallback((v) => {
+    const clamped = Math.min(2, Math.max(0.1, v));
+    effectSpeedRef.current = clamped;
+    setEffectSpeedState(clamped);
+    if (rendererRef.current) rendererRef.current.effectSpeed = clamped;
+  }, []);
+
+  const toggleEffectPlay = useCallback(() => {
+    setEffectPlaying((p) => {
+      const next = !p;
+      if (rendererRef.current) rendererRef.current.effectPaused = !next;
+      return next;
+    });
+  }, []);
+
+  const changeEffectSchedule = useCallback((id) => {
+    setEffectSchedule(id);
+    const system = rendererRef.current?.particleSystem;
+    if (!system) return;
+    const routine = effectRoutinesRef.current.find((r) => r.id === id);
+    if (!routine) { system.clearEffect(); setEffectPlaying(false); return; }
+    system.playEffectRoutine(routine.flat.commands, { loop: true, sounds: routine.flat.sounds });
+    rendererRef.current.effectPaused = false;
+    setEffectPlaying(true);
+  }, []);
+
+  /** Reset: restart the routine from frame 0 (speed reset is handled by onSpeed). */
+  const restartEffect = useCallback(() => {
+    const renderer = rendererRef.current;
+    renderer?.particleSystem?.restartEffect();
+    if (renderer) renderer.effectPaused = false;
+    setEffectPlaying(true);
+  }, []);
+
   /**
    * Zone BGM from the server's zone_settings (see dev/bake-zone-music.mjs).
    * Each zone names a day and a night track; id 0 means genuine silence, which
@@ -1032,7 +1326,8 @@ export default function App() {
           } catch { /* stale/corrupt entry — just show the list */ }
           return;
         }
-        if (restoredView === 'music' || restoredView === 'sfx') return;   // lists only
+        // Lists that own no model on boot — don't resurrect the last DAT behind them.
+        if (restoredView === 'music' || restoredView === 'sfx' || restoredView === 'effects') return;
 
         // Prefer the last successfully loaded DAT; fall back to the default demo model.
         let paths = null;
@@ -1170,6 +1465,22 @@ export default function App() {
     speed: playbackSpeed, onSpeed: setPlaybackSpeed,
   };
 
+  // Effect playback panel: Schedule = the DAT's 0x07 routines, transport + speed.
+  // No `onAnimChange` (no clip picker) and no `frameSink` (no scrubber), so the
+  // shared AnimationPanel renders just those rows. `onSeek` is the Reset button.
+  const effectAnim = {
+    schedules: effectRoutines.map((r) => ({ id: r.id, clipIds: [] })),
+    currentSchedule: effectSchedule,
+    onScheduleChange: changeEffectSchedule,
+    playing: effectPlaying,
+    onTogglePlay: toggleEffectPlay,
+    speed: effectSpeed,
+    onSpeed: setEffectSpeed,
+    onSeek: restartEffect,
+    volume: effectVolume,
+    onVolume: setEffectVolume,
+  };
+
   /** Status-bar path → show that DAT in the system file manager, selected.
    *  sourcePathRef keeps the real casing; selectedDat is lowercased for the
    *  tree's own matching and would be a poor thing to hand the OS. */
@@ -1290,6 +1601,15 @@ export default function App() {
     if (!(ZONE_VIEWS.has(prev) && ZONE_VIEWS.has(leftView))) unloadModel();
     if (!(AUDIO_VIEWS.has(prev) && AUDIO_VIEWS.has(leftView))) player.stop();
     if (leftView !== 'images') { setImageEntry(null); setImageDoc(null); setImageSet(null); }
+    setShowAxes(leftView === 'effects');   // per-view default; the toggle still overrides
+    // Leaving Effects: unloadModel already tore down the particle scene; drop the
+    // selection so returning starts clean instead of showing dead transport rows.
+    if (prev === 'effects' && leftView !== 'effects') {
+      effectRoutinesRef.current = [];
+      setEffectEntry(null);
+      setEffectRoutines([]);
+      setEffectSchedule('');
+    }
   }, [leftView, unloadModel, player]);
 
   const loadImage = useCallback(async (entry) => {
@@ -1450,7 +1770,7 @@ export default function App() {
         break;
       }
       case 'reset-camera':
-        rendererRef.current.fitCamera();
+        rendererRef.current.resetCamera();
         break;
       case 'toggle-wasd':
         setWasd(!wasdRef.current);
@@ -1508,6 +1828,12 @@ export default function App() {
       case 'toggle-skybox':
         setSkybox(!showSkybox);
         break;
+      case 'toggle-axes':
+        setShowAxes((v) => !v);
+        break;
+      case 'toggle-grid':
+        setShowGrid((v) => !v);
+        break;
       case 'assets-files':
         setLeftView('files');
         break;
@@ -1531,6 +1857,9 @@ export default function App() {
         break;
       case 'assets-images':
         setLeftView('images');
+        break;
+      case 'assets-effects':
+        setLeftView('effects');
         break;
       case 'open-dat':
         backend.pickFile(settingsRef.current?.gamePath || null)
@@ -1662,6 +1991,8 @@ export default function App() {
           navmesh: showNavmesh,
           skybox: showSkybox,
           effects: showEffects,
+          axes: showAxes,
+          grid: showGrid,
           noCollision: !hasCollision,
           noNavmesh: !hasNavmesh,
           noSkybox: !hasSkybox,
@@ -1726,6 +2057,10 @@ export default function App() {
           onSelectImage={loadImage}
           onError={(msg) => setStatusText(msg)}
         />
+      )}
+
+      {explorerOpen && leftView === 'effects' && (
+        <EffectList onSelect={loadEffect} selectedPath={effectEntry?.path} />
       )}
 
       {leftView === 'images' && imageDoc && (
@@ -1794,6 +2129,12 @@ export default function App() {
         <AnimationPanel pc={leftView === 'pc' ? pc : null} anim={animControls} />
       )}
 
+      {/* Standalone effect: Schedule picker + transport + speed (no scrubber —
+          a live particle sim isn't frame-seekable). */}
+      {leftView === 'effects' && effectEntry && (
+        <AnimationPanel anim={effectAnim} />
+      )}
+
       <div id="status" className="panel mono">
         {!player.current && modelPath && selectedDat ? (
           <Tooltip content="Show in Explorer">
@@ -1824,6 +2165,10 @@ export default function App() {
                 <>
                   <span className="status-sep">·</span>
                   <button className="status-link" onClick={() => setSkeletonOpen((v) => !v)}>Skeleton</button>
+                </>
+              )}
+              {modelInfo && DETAIL_VIEWS.has(leftView) && (
+                <>
                   <span className="status-sep">·</span>
                   <button className="status-link" onClick={() => setDetailsOpen((v) => !v)}>Details</button>
                 </>
@@ -1854,6 +2199,11 @@ export default function App() {
                 <>
                   <span className="status-sep">·</span>
                   <button className="status-link" onClick={() => setSkeletonOpen((v) => !v)}>Skeleton</button>
+                </>
+              )}
+              {/* Effects have no skeleton, but they do have sprite images. */}
+              {DETAIL_VIEWS.has(leftView) && (
+                <>
                   <span className="status-sep">·</span>
                   <button className="status-link" onClick={() => setDetailsOpen((v) => !v)}>Details</button>
                 </>
@@ -1870,7 +2220,7 @@ export default function App() {
         />
       )}
 
-      {detailsOpen && modelInfo && !player.current && ORBIT_VIEWS.has(leftView) && (
+      {detailsOpen && modelInfo && !player.current && DETAIL_VIEWS.has(leftView) && (
         <DetailsPanel
           info={modelInfo}
           animClip={animsRef.current.find((g) => g.id === currentAnim)?.clip ?? null}

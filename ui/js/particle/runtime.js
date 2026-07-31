@@ -182,11 +182,13 @@ export class Particle {
 
     if (this.config.cameraAttachedBasePosition) {
       if (this.age_ > 0) return;
-      const camera = this.runtime.camera;
-      const basis = camera.getBasis();
-      const b = this.config.basePosition;
-      const offset = basis.left.scale(-b.x).addInPlace(basis.up.scale(b.y)).addInPlace(basis.forward.scale(-b.z));
-      this.associatedPosition.copyFrom(camera.getPosition()).addInPlace(offset);
+      // Anchored to the camera POSITION but NOT its rotation: the offset is in
+      // fixed world axes, and the drawer renders these through a static
+      // world−Z view (xim GLDrawer StaticCamera; radiance FFXIEffectFacade:2195
+      // — mapping onto the live basis made the quads swing with the view).
+      // Rank-up emblems and similar screen images ride this path.
+      this.associatedPosition.copyFrom(this.runtime.camera.getPosition())
+        .addInPlace(this.config.basePosition);
     } else if (this.config.followCamera) {
       this.associatedPosition.copyFrom(this.runtime.camera.getPosition());
     } else {

@@ -273,6 +273,42 @@
    makes the UA draw a focus ring around the whole scroller, which reads as a
    stray border — the highlighted row is the feedback that matters. */
 .list-scroll:focus, .list-scroll:focus-visible { outline: none; }
+
+/* Effects list: sticky search box above the category tree. */
+.list-search-wrap {
+  flex: 0 0 auto;
+  display: flex; align-items: center; gap: 6px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--ring);
+}
+.list-search-wrap > .icon { font-size: 17px; color: var(--muted); flex: 0 0 auto; }
+.list-search {
+  flex: 1 1 auto; min-width: 0;
+  background: rgba(0, 0, 0, 0.22);
+  border: 1px solid var(--ring-strong);
+  border-radius: 6px;
+  padding: 5px 8px;
+  color: var(--text);
+  font: 400 13px/1.3 var(--font-ui);
+  outline: none;
+}
+.list-search:focus { border-color: var(--accent); }
+.list-search::placeholder { color: var(--muted); }
+.list-search-clear {
+  flex: 0 0 auto;
+  display: flex; align-items: center; justify-content: center;
+  width: 22px; height: 22px; padding: 0;
+  background: transparent; border: none; border-radius: 5px;
+  color: var(--muted); cursor: pointer;
+}
+.list-search-clear:hover { background: rgba(255, 255, 255, 0.08); color: var(--text); }
+.list-search-clear .icon { font-size: 16px; }
+
+/* Effect row: name grows, category + dat id sit to the right. */
+.effect-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.effect-sub { flex: 0 0 auto; color: var(--muted); opacity: 0.85; }
+.effect-id { flex: 0 0 auto; color: var(--muted); padding-left: 2px; }
+
 .tree-browse {
   flex: 0 0 auto;
   padding: 7px 10px;
@@ -1278,6 +1314,44 @@ input[type='color'] {
   border: 1px solid rgba(77, 163, 255, 0.28);
   border-radius: 999px;
 }
+.help-controls {
+  width: 100%;
+  display: flex; flex-direction: column; gap: 10px;
+  margin: 10px 0 4px;
+}
+.help-controls-group {
+  display: flex; flex-direction: column; gap: 3px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--ring);
+  background: rgba(0, 0, 0, 0.18);
+  text-align: left;
+}
+.help-controls-title {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin-bottom: 4px;
+}
+.help-key-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  font-size: 12.5px;
+}
+.help-keys {
+  flex: 0 0 auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11.5px;
+  padding: 2px 7px;
+  border-radius: 5px;
+  border: 1px solid var(--ring);
+  background: rgba(0, 0, 0, 0.28);
+  color: var(--gray-100);
+  white-space: nowrap;
+}
+.help-action { color: var(--gray-300); text-align: right; }
+
 .help-links { width: 100%; display: flex; flex-direction: column; gap: 6px; margin-top: 4px; }
 .help-link {
   display: flex; align-items: center; gap: 8px;

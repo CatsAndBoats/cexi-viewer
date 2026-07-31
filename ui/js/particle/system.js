@@ -61,6 +61,14 @@ function dirPath(dir) {
  */
 const SINGLETON_EMIT_TIME = 0;
 
+/**
+ * Backstop for the standalone-effect loop: how long past an effect's computed
+ * end to keep waiting before re-arming anyway. Only reached when something never
+ * finishes on its own (a self-resetting particle, or a sound that never reports
+ * completion), so it is deliberately generous — 5s at the 60/s effect clock.
+ */
+const LOOP_TAIL_FRAMES = 300;
+
 /** Stand-in until the renderer supplies the real view. */
 const NULL_CAMERA = {
   getPosition: () => new Vec3(),
@@ -167,6 +175,10 @@ export class ParticleSystem {
 
     this.audioBackend = null;    // set by the host to enable weather/particle audio
     this.floorQuery = null;      // set by the host for decal / ground projection
+
+    // Standalone spell/ability effect playback (see playEffectRoutine).
+    this._effect = null;
+    this._effectAssociation = null;
   }
 
   warn(msg) {
@@ -235,11 +247,140 @@ export class ParticleSystem {
     return new ParticleGenerator(this, effectResource, association, maxEmitTime, parent);
   }
 
+  // ── standalone effect playback (spell / ability DATs) ─────────────────────
+
+  /**
+   * Arm a spell/ability routine for playback. Each 0x02 command spawns one
+   * generator at a start delay, for an emit duration (0 = a single emission).
+   * These generators are all TargetActor-attached and non-auto-running, so with
+   * no actor present they emit at the world origin for their window then drain.
+   * `loop` re-arms the routine once it and its trailing particles have finished,
+   * giving a continuous preview.
+   */
+  playEffectRoutine(commands, { loop = true, sounds = [] } = {}) {
+    this.clearEffect();
+    const cmds = commands ?? [];
+    const emitSpan = Math.max(1, ...cmds.map((c) => c.delay + Math.max(c.dur, 1)));
+    this._effect = {
+      commands: cmds,
+      sounds,
+      playhead: 0,
+      fired: new Set(),
+      firedSounds: new Set(),
+      voices: [],
+      loop,
+      length: emitSpan,
+      // Grows as generators fire, to emit-end + the particles' own lifespan —
+      // the frame the effect is actually over. See #advanceEffect.
+      expectedEnd: emitSpan,
+    };
+    this._effectAssociation = { kind: 'effect', key: 'effect:preview' };
+  }
+
+  /** Tear down the armed routine and every particle it spawned. */
+  clearEffect() {
+    if (this._effectAssociation) this.effectManager.clearEffects(this._effectAssociation);
+    // Switching effect or schedule must take its sounds with it, or the old
+    // one-shots keep playing over whatever is loaded next. stopOneShots also
+    // catches particle-attached emitters, which this routine never held handles
+    // for; the ambient weather bed is deliberately left alone.
+    for (const v of this._effect?.voices ?? []) v.stop();
+    this.audioBackend?.stopOneShots?.();
+    this._effect = null;
+  }
+
+  /** Restart the armed routine from its first frame (Reset). */
+  restartEffect() {
+    if (!this._effect) return;
+    this.effectManager.clearEffects(this._effectAssociation);
+    for (const v of this._effect.voices) v.stop();
+    this.audioBackend?.stopOneShots?.();
+    this._effect.voices.length = 0;
+    this._effect.playhead = 0;
+    this._effect.fired.clear();
+    this._effect.firedSounds.clear();
+  }
+
+  #advanceEffect(elapsedFrames) {
+    const e = this._effect;
+    if (!e) return;
+    e.playhead += elapsedFrames;
+
+    for (let i = 0; i < e.commands.length; i++) {
+      if (e.fired.has(i)) continue;
+      const c = e.commands[i];
+      if (e.playhead < c.delay) continue;
+      e.fired.add(i);
+      const effect = this.areaRoot?.getChild(c.genId, SEC.EFFECT)
+        ?? this.areaRoot?.getChildRecursive(c.genId, SEC.EFFECT);
+      if (!effect) { this.warn(`effect generator not found: ${c.genId}`); continue; }
+      // A generator stops *emitting* at delay+dur, but the last particle it
+      // emitted lives maxLifeSpan frames beyond that. Aero V finishes emitting
+      // at frame 205 and is still on screen at 425.
+      const life = effect.def?.particleConfiguration?.maxLifeSpan ?? 0;
+      e.expectedEnd = Math.max(e.expectedEnd, c.delay + Math.max(c.dur, 1) + life);
+      this.effectManager.register(
+        this._effectAssociation,
+        this.createGenerator(effect, this._effectAssociation, c.dur > 0 ? c.dur : SINGLETON_EMIT_TIME),
+      );
+    }
+
+    // Routine-level sounds (ops 0x0a/0x0b/0x53/0x60): one-shots on the same
+    // timeline as the generators. A ref that isn't really a sound pointer just
+    // doesn't resolve, so it costs nothing.
+    for (let i = 0; i < e.sounds.length; i++) {
+      if (e.firedSounds.has(i)) continue;
+      const s = e.sounds[i];
+      if (e.playhead < s.delay) continue;
+      e.firedSounds.add(i);
+      const pointer = this.areaRoot?.getChildRecursive(s.soundId, SEC.SOUND_POINTER)
+        ?? this.globalRoot?.getChildRecursive(s.soundId, SEC.SOUND_POINTER);
+      if (!pointer) continue;
+      const voice = this.playSoundEffect(pointer, this._effectAssociation, { looping: false });
+      if (voice) e.voices.push(voice);
+    }
+
+    /*
+     * Re-arm when the effect is genuinely finished, not on a fixed timer.
+     *
+     * The old rule waited `emitSpan + 60`, but emitSpan is only how long the
+     * generators *emit* — Aero V emits until frame 205 and its particles live to
+     * 425, so it was being cut off and restarted 5 seconds early. Sounds suffer
+     * the same way: Banishga IV's tail sound is authored at frame 168, exactly
+     * its true end, so a loop at 208 fired it over an already-cleared stage.
+     *
+     * So: everything fired, nothing left alive, and no one-shot still audible.
+     * The expectedEnd cap is the backstop for generators that never die (a
+     * RepeatExpirationHandler particle resets its own age forever).
+     */
+    const allFired = e.fired.size >= e.commands.length
+      && e.firedSounds.size >= e.sounds.length;
+    if (!allFired) return;
+
+    e.voices = e.voices.filter((v) => !v.isComplete());
+    const finished = this.effectManager.countParticles() === 0 && e.voices.length === 0;
+
+    if (finished || e.playhead >= e.expectedEnd + LOOP_TAIL_FRAMES) {
+      if (!e.loop) { this.clearEffect(); return; }
+      this.effectManager.clearEffects(this._effectAssociation);
+      // Normally a no-op — `finished` already requires silence — but the
+      // LOOP_TAIL_FRAMES backstop can re-arm while a sound is still going, and
+      // that must not bleed into the next cycle.
+      for (const v of e.voices) v.stop();
+      this.audioBackend?.stopOneShots?.();
+      e.voices.length = 0;
+      e.playhead = 0;
+      e.fired.clear();
+      e.firedSounds.clear();
+    }
+  }
+
   // ── per-frame ────────────────────────────────────────────────────────────
 
   update(elapsedFrames) {
     this._screenFlashes.length = 0;
     this._cameraShake = 0;
+    this.#advanceEffect(elapsedFrames);
     this.effectManager.update(elapsedFrames);
   }
 

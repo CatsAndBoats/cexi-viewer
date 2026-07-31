@@ -44,11 +44,26 @@ export function DetailsPanel({ info, animClip, animId, schedule, onClose, onOpen
           </div>
         )}
 
-        <Section title={info.zone ? 'Zone' : 'Model'} icon={info.zone ? 'map' : 'deployed_code'}>
+        <Section
+          title={info.zone ? 'Zone' : info.effect ? 'Effect' : 'Model'}
+          icon={info.zone ? 'map' : info.effect ? 'auto_awesome' : 'deployed_code'}
+        >
           <Row label="Source" value={part ? part.itemLabel || part.label : info.name} mono />
           {part && <Row label="DAT" value={part.relPaths.join(' + ')} mono />}
           {info.zone?.path && <Row label="DAT" value={info.zone.path} mono />}
           {info.zone?.id != null && <Row label="Zone ID" value={info.zone.id} />}
+          {info.effect && (
+            <>
+              <Row label="DAT" value={info.effect.path} mono />
+              <Row label="Category" value={info.effect.category} />
+              <Row label="Generators" value={info.effect.generators} />
+              {info.effect.sounds > 0 && <Row label="Sounds" value={info.effect.sounds} />}
+              <Row label="Sprite sheets" value={info.effect.spriteSheets} />
+              {info.effect.particleMeshes > 0 && (
+                <Row label="Particle meshes" value={info.effect.particleMeshes} />
+              )}
+            </>
+          )}
           {info.zone ? (
             <>
               <Row label="Placements" value={fmtNum(info.zone.placementCount)} />

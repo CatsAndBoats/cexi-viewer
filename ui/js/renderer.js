@@ -453,6 +453,17 @@ export class Renderer {
     this.batches = [];
     this.textures = new Map();
 
+    // Origin axis gizmo (View > Toggle Axes; on by default in the Effects view).
+    this.showAxes = false;
+    // World grid on the ground plane (View > Toggle Grid) — the floor, as lines.
+    this.showGrid = false;
+    this.gridLines = null;   // { vao, vbo, count, kind } — rebuilt when range kind changes
+
+    // Standalone spell/ability effect playback (no model, particles at origin).
+    this.effectMode = false;
+    this.effectPaused = false;
+    this.effectSpeed = 1;
+
     this.rotArray = new Float32Array(MAX_JOINTS * 4);
     this.transArray = new Float32Array(MAX_JOINTS * 4);
     this.scaleArray = new Float32Array(MAX_JOINTS * 4);
@@ -579,6 +590,7 @@ export class Renderer {
   /** keepCamera: leave the orbit untouched (gear swap on the same actor). */
   setModel(model, keepCamera = false) {
     const gl = this.gl;
+    this.effectMode = false;   // any real model/zone load leaves effect mode
     for (const b of this.batches) {
       gl.deleteBuffer(b.vbo);
       if (b.wireEbo) gl.deleteBuffer(b.wireEbo);
@@ -660,6 +672,72 @@ export class Renderer {
 
     if (keepCamera) this.snapFloorToFeet();
     else this.fitCamera();
+  }
+
+  /**
+   * Show a standalone spell/ability effect: no model, just its particles played
+   * at the world origin. Textures come from the effect DAT and shared
+   * ROM/0/0.DAT; `system` is a ParticleSystem already armed via playEffectRoutine.
+   */
+  setEffectScene(system, textures, keepCamera = false) {
+    this.setModel(null);   // clears batches, textures and any prior particle system
+    for (const tex of textures.values()) {
+      const t = this.createTexture(tex);
+      if (t) this.textures.set(tex.name, t);
+    }
+    this.effectMode = true;
+    this.effectPaused = false;
+    this.effectSpeed = 1;
+    this.setParticleSystem(system, null);   // installs the camera adapter
+    // Switching between effects leaves the camera fully alone (keepCamera). The
+    // FIRST effect only normalizes what must be right (Y-up, entity ranges,
+    // origin pivot) while keeping the user's zoom and angle — lining up a shot
+    // on the empty stage survives picking an effect. F = full reframe.
+    if (!keepCamera) this.frameEffect(true);
+  }
+
+  /**
+   * Frame the world origin for standalone effect playback (no model bounds).
+   * Measured particle extents for typical spells sit within DAT-space
+   * X,Z ∈ [-3,3], Y ∈ [-4,1.5] around the target actor origin; the drawer maps
+   * DAT → display as (−x,−y,z), so that vertical range lands at display Y ≈
+   * [-1.5,4] (the effect rises *above* the origin on screen). Frame that box
+   * with a little margin — larger AoE/summon effects can be zoomed out.
+   */
+  /**
+   * @param {boolean} keepView keep the user's distance/yaw/pitch and only
+   *   normalize what MUST be right for effects (Y-up camera, entity ranges,
+   *   pivot on the origin). Used by the first effect load, so lining up a shot
+   *   on the empty stage isn't thrown away the moment an effect is picked.
+   *   Plain frameEffect() — F / Reset Camera — is the full known-good framing.
+   */
+  frameEffect(keepView = false) {
+    const cam = this.camera;
+    const prev = { distance: cam.distance, yaw: cam.yaw, pitch: cam.pitch };
+    cam.setRangeFor('entity');
+    // Particles are drawn in the Y-up display space (DISPLAY_ROT), exactly like
+    // zone geometry — NOT the Y-down space entity models are drawn in.
+    // setRangeFor('entity') gives the right near/far and zoom scale for a small
+    // effect, but it also sets the FFXI Y-down camera (up = [0,-1,0]), which
+    // renders the whole effect vertically mirrored: rising particles fall and
+    // their trail hangs above them instead of below. Force the zone/editor Y-up
+    // camera so the effect is drawn in the space its geometry was built for.
+    cam.yUp = true;
+    cam.fit([-4, -2.5, -4], [4, 5.5, 4]);
+    // fit() targets the box centre (0, 1.5, 0), which put the orbit pivot above
+    // the axes crossing — rotation felt anchored to a point that wasn't the
+    // origin. Keep fit's distance/pitch (framed for effects that rise a few
+    // units) but pivot exactly on 0,0,0, which is where every standalone
+    // effect actually lives. (Cursor-zoom then deliberately walks the pivot
+    // toward what you zoom at; F/reset comes back here.)
+    cam.target = [0, 0, 0];
+    if (keepView) {
+      cam.yaw = prev.yaw;
+      cam.pitch = prev.pitch;
+      // Clamp into the entity range — a distance inherited from a zone's fly
+      // camera can be thousands of units out.
+      cam.distance = Math.min(Math.max(prev.distance, cam.minDistance), cam.maxDistance);
+    }
   }
 
   /** Load/replace navmesh overlay (display-space positions). Pass null to clear. */
@@ -769,6 +847,125 @@ export class Renderer {
    * Uses the joint's real parent, not pose.parentOverrides — those re-parent a
    * gripped weapon and would draw a bone that isn't anatomically there.
    */
+  /**
+   * Origin gizmo: the three world axes through (0,0,0) — X red, Y green, Z blue,
+   * with the negative half dimmed so the sign is readable. Mainly for the
+   * Effects view, where particles play at the origin and there is no other
+   * geometry to judge position or scale against.
+   *
+   * Built once as unit-length lines and scaled to a fixed WORLD size, so it
+   * behaves like an object in the scene — zooming in makes it bigger on screen,
+   * zooming out shrinks it (a constant-screen-size gizmo felt wrong to use as a
+   * scale reference). Entity/effect scenes get a few units; zones get a larger
+   * one so it's findable at terrain scale.
+   */
+  _drawAxes(viewProj) {
+    const gl = this.gl;
+
+    if (!this.axesLines) {
+      // 3 axes × 2 halves × 2 verts, each (x,y,z, r,g,b).
+      const DIM = 0.28;
+      const axis = (i, r, g, b) => {
+        const p = [0, 0, 0]; p[i] = 1;
+        const n = [0, 0, 0]; n[i] = -1;
+        return [
+          0, 0, 0, r, g, b, p[0], p[1], p[2], r, g, b,
+          0, 0, 0, r * DIM, g * DIM, b * DIM, n[0], n[1], n[2], r * DIM, g * DIM, b * DIM,
+        ];
+      };
+      const data = new Float32Array([
+        ...axis(0, 1.0, 0.28, 0.30),   // X
+        ...axis(1, 0.35, 0.95, 0.40),  // Y
+        ...axis(2, 0.35, 0.55, 1.0),   // Z
+      ]);
+      const vbo = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+      gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+      const vao = gl.createVertexArray();
+      gl.bindVertexArray(vao);
+      gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+      gl.enableVertexAttribArray(0);
+      gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 24, 0);
+      gl.enableVertexAttribArray(1);
+      gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 24, 12);
+      gl.bindVertexArray(null);
+      this.axesLines = { vao, vbo, count: data.length / 6 };
+    }
+
+    const s = this.camera.rangeKind === 'zone' ? 50 : 2;
+    const scale = new Float32Array([s, 0, 0, 0, 0, s, 0, 0, 0, 0, s, 0, 0, 0, 0, 1]);
+    const mvp = mat4Multiply(viewProj, scale);
+
+    gl.useProgram(this.overlayProgram);
+    gl.uniformMatrix4fv(this.overlayUniforms.viewProj, false, mvp);
+    gl.uniform1f(this.overlayUniforms.opacity, 1);
+    gl.disable(gl.BLEND);
+    gl.disable(gl.DEPTH_TEST);   // a reference gizmo is no use once it's buried
+    gl.depthMask(false);
+    gl.bindVertexArray(this.axesLines.vao);
+    gl.drawArrays(gl.LINES, 0, this.axesLines.count);
+    gl.bindVertexArray(null);
+    gl.enable(gl.DEPTH_TEST);
+    gl.depthMask(true);
+  }
+
+  /**
+   * World grid — the floor, as lines. XZ plane lines at the same height the
+   * textured floor would sit (feet for entities, world 0 for zones/effects),
+   * lifted a hair toward the camera side so the two don't z-fight when both are
+   * on. Fixed world spacing (1 unit; 10 in zones), so like the axes it reads as
+   * scene scale, not screen furniture. Every 5th line is brighter.
+   */
+  _drawGrid(viewProj) {
+    const gl = this.gl;
+    const kind = this.camera.rangeKind === 'zone' ? 'zone' : 'entity';
+
+    if (!this.gridLines || this.gridLines.kind !== kind) {
+      if (this.gridLines) {
+        gl.deleteBuffer(this.gridLines.vbo);
+        gl.deleteVertexArray(this.gridLines.vao);
+      }
+      const half = kind === 'zone' ? 500 : 10;
+      const step = kind === 'zone' ? 10 : 1;
+      const MINOR = 0.21, MAJOR = 0.38;
+      const verts = [];
+      for (let i = -half; i <= half; i += step) {
+        const c = (i % (step * 5) === 0) ? MAJOR : MINOR;
+        verts.push(i, 0, -half, c, c, c, i, 0, half, c, c, c);
+        verts.push(-half, 0, i, c, c, c, half, 0, i, c, c, c);
+      }
+      const data = new Float32Array(verts);
+      const vbo = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+      gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+      const vao = gl.createVertexArray();
+      gl.bindVertexArray(vao);
+      gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+      gl.enableVertexAttribArray(0);
+      gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 24, 0);
+      gl.enableVertexAttribArray(1);
+      gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 24, 12);
+      gl.bindVertexArray(null);
+      this.gridLines = { vao, vbo, count: data.length / 6, kind };
+    }
+
+    const baseY = (this.effectMode || this.model?.kind === 'zone') ? 0 : (this.floorY ?? 0);
+    const y = baseY + (this.camera.yUp ? 0.02 : -0.02);
+    const move = new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, y, 0, 1]);
+    const mvp = mat4Multiply(viewProj, move);
+
+    gl.useProgram(this.overlayProgram);
+    gl.uniformMatrix4fv(this.overlayUniforms.viewProj, false, mvp);
+    gl.uniform1f(this.overlayUniforms.opacity, 1);
+    gl.disable(gl.BLEND);
+    gl.enable(gl.DEPTH_TEST);   // world object: hidden behind terrain/models
+    gl.depthMask(false);
+    gl.bindVertexArray(this.gridLines.vao);
+    gl.drawArrays(gl.LINES, 0, this.gridLines.count);
+    gl.bindVertexArray(null);
+    gl.depthMask(true);
+  }
+
   _drawSkeleton(viewProj) {
     const gl = this.gl;
     const joints = this.pose?.skeleton?.joints;
@@ -847,6 +1044,28 @@ export class Renderer {
     if (!bounds) return;
     this.camera.fit(bounds.min, bounds.max);
     this.snapFloorToFeet(bounds);
+  }
+
+  /** Reset the camera to frame whatever is on screen — a model/zone or a
+   *  standalone effect (which has no model bounds to fit). */
+  resetCamera() {
+    if (this.effectMode) this.frameEffect();
+    else this.fitCamera();
+  }
+
+  /**
+   * Wheel zoom anchored at the cursor. Converts client coords to the NDC the
+   * scene is actually drawn at — including the Explorer screen-offset shift the
+   * projection carries (see render()), which moves the picture right; the ray
+   * must be cast where the pixels are, not where unshifted NDC says.
+   */
+  zoomAt(clientX, clientY, wheelDelta) {
+    const rect = this.canvas.getBoundingClientRect();
+    if (!rect.width || !rect.height) { this.camera.zoom(wheelDelta); return; }
+    const dx = this.screenOffsetX ? (2 * this.screenOffsetX) / rect.width : 0;
+    const ndcX = (((clientX - rect.left) / rect.width) * 2 - 1) - dx;
+    const ndcY = -((((clientY - rect.top) / rect.height) * 2) - 1);
+    this.camera.zoomAt(wheelDelta, ndcX, ndcY, rect.width / rect.height);
   }
 
   /**
@@ -1182,6 +1401,8 @@ export class Renderer {
       this._drawParticles();
       this._drawOverlay(viewProj, this.showCollision ? this.collisionOverlay : null, this.collisionOpacity);
       this._drawOverlay(viewProj, this.showNavmesh ? this.navmeshOverlay : null, this.navmeshOpacity);
+      if (this.showGrid) this._drawGrid(viewProj);
+      if (this.showAxes) this._drawAxes(viewProj);
       gl.depthMask(true);
       gl.disable(gl.BLEND);
       gl.blendEquation(gl.FUNC_ADD);   // surfaces may leave REVERSE_SUBTRACT set
@@ -1192,10 +1413,33 @@ export class Renderer {
       return;
     }
 
-    if (!this.pose) return;
+    // Standalone spell/ability effect: just its particles at the world origin,
+    // no model geometry behind them. Drawn before the model early-outs below,
+    // which would otherwise skip it (there is no pose).
+    if (this.effectMode && this.particleSystem) {
+      if (this.showGrid) this._drawGrid(viewProj);   // before particles: they blend over it
+      this._drawParticles();
+      if (this.showAxes) this._drawAxes(viewProj);
+      gl.depthMask(true);
+      gl.disable(gl.BLEND);
+      gl.blendEquation(gl.FUNC_ADD);
+      gl.disable(gl.CULL_FACE);
+      gl.bindVertexArray(null);
+      return;
+    }
+
+    const drawHelpers = () => {
+      if (this.showGrid) this._drawGrid(viewProj);
+      if (this.showAxes) this._drawAxes(viewProj);
+    };
+    if (!this.pose) { drawHelpers(); return; }
     // "Just the bones": the rig replaces the mesh rather than overlaying it.
-    if (this.showSkeleton) { this._drawSkeleton(viewProj); return; }
-    if (this.batches.length === 0) return;
+    if (this.showSkeleton) {
+      this._drawSkeleton(viewProj);
+      drawHelpers();
+      return;
+    }
+    if (this.batches.length === 0) { drawHelpers(); return; }
 
     gl.useProgram(this.program);
     if (this.poseDirty) {
@@ -1290,6 +1534,8 @@ export class Renderer {
     // Debug overlays on top (collision terrain colours, UE-green navmesh).
     this._drawOverlay(viewProj, this.showCollision ? this.collisionOverlay : null, this.collisionOpacity);
     this._drawOverlay(viewProj, this.showNavmesh ? this.navmeshOverlay : null, this.navmeshOpacity);
+    if (this.showGrid) this._drawGrid(viewProj);
+    if (this.showAxes) this._drawAxes(viewProj);
 
     gl.depthMask(true);
     gl.disable(gl.BLEND);
@@ -1472,9 +1718,17 @@ export class Renderer {
     const system = this.particleSystem;
     if (!system) return;
 
-    // FFXI's simulation is fixed at 30 frames per second; clamp so a stalled tab
-    // doesn't fast-forward every effect on the next frame.
-    const elapsedFrames = Math.min(4, Math.max(0, (dtSeconds || 1 / 60) * 30));
+    // The FFXI effect engine ticks at 60 frames per second (see particle/math.js
+    // FPS); clamp so a stalled tab doesn't fast-forward every effect on the next
+    // frame (8 frames ≈ 133 ms, same real-time tolerance as before).
+    let elapsedFrames = Math.min(8, Math.max(0, (dtSeconds || 1 / 60) * 60));
+
+    // Standalone effect playback: Stop freezes the sim, and the Speed slider
+    // scales the whole effect (particles and its routine schedule alike).
+    if (this.effectMode) {
+      if (this.effectPaused) return;
+      elapsedFrames *= this.effectSpeed ?? 1;
+    }
 
     const env = this.particleEnvironment;
     if (env) {

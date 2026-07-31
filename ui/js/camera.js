@@ -132,8 +132,16 @@ export class OrbitCamera {
     return mat4Perspective((this.fovDegrees * Math.PI) / 180, aspect, near, far);
   }
 
+  /**
+   * Same yaw-sign rule as flyLook below: flipping the up vector flips which
+   * world yaw direction reads as screen-right, so Y-up orbiting (Effects view —
+   * the only orbit+Y-up combination) needs the opposite sign or left/right
+   * invert. Pitch and pan are immune: pitch raises the eye in both conventions,
+   * and pan derives its axes from `this.up`, which flips with the view itself.
+   */
   orbit(dx, dy) {
-    this.yaw += dx * 0.01;
+    const yawSign = this.yUp ? -1 : 1;
+    this.yaw += yawSign * dx * 0.01;
     this.pitch = Math.min(Math.max(this.pitch + dy * 0.01, -1.55), 1.55);
   }
 
@@ -166,6 +174,62 @@ export class OrbitCamera {
       Math.max(this.distance * Math.pow(0.999, wheelDelta), this.minDistance),
       this.maxDistance,
     );
+  }
+
+  /**
+   * Orbit zoom anchored at the cursor: the world point under (ndcX, ndcY)
+   * stays put on screen while the distance changes, so zooming dives toward
+   * wherever the mouse is instead of the panel centre.
+   *
+   * The anchor is the cursor ray's intersection with the plane through the
+   * target perpendicular to the view — no depth readback needed. Scaling the
+   * (target − anchor) offset by the same factor as the distance keeps the
+   * anchor's projection fixed: both the lateral offset and the depth shrink
+   * together, so the angle from the eye to the anchor never changes.
+   */
+  zoomAt(wheelDelta, ndcX, ndcY, aspect) {
+    if (this.mode === 'fly') { this.zoom(wheelDelta); return; }
+    const oldDistance = this.distance;
+    this.zoom(wheelDelta);
+    const k = this.distance / oldDistance;
+    if (k === 1) return;
+
+    // View basis straight off the view matrix (rows), so yUp handling and any
+    // future camera change stay in one place. Row 3 is "back" (+eye direction).
+    const m = this.viewMatrix();
+    const right = [m[0], m[4], m[8]];
+    const upv = [m[1], m[5], m[9]];
+    const fwd = [-m[2], -m[6], -m[10]];
+
+    const th = Math.tan((this.fovDegrees * Math.PI) / 360);
+    const dir = norm([
+      fwd[0] + right[0] * ndcX * th * aspect + upv[0] * ndcY * th,
+      fwd[1] + right[1] * ndcX * th * aspect + upv[1] * ndcY * th,
+      fwd[2] + right[2] * ndcX * th * aspect + upv[2] * ndcY * th,
+    ]);
+    const denom = dir[0] * fwd[0] + dir[1] * fwd[1] + dir[2] * fwd[2];
+    if (denom < 1e-4) return;   // grazing ray; plain zoom already applied
+
+    const e = this.eyeAt(oldDistance);
+    const t = oldDistance / denom;   // target plane sits oldDistance ahead
+    const anchor = [e[0] + dir[0] * t, e[1] + dir[1] * t, e[2] + dir[2] * t];
+    this.target = [
+      anchor[0] + (this.target[0] - anchor[0]) * k,
+      anchor[1] + (this.target[1] - anchor[1]) * k,
+      anchor[2] + (this.target[2] - anchor[2]) * k,
+    ];
+  }
+
+  /** Orbit eye position for an arbitrary distance (zoomAt needs the pre-zoom eye). */
+  eyeAt(distance) {
+    const cp = Math.cos(this.pitch);
+    const sp = Math.sin(this.pitch);
+    const yOff = this.yUp ? sp : -sp;
+    return [
+      this.target[0] + cp * Math.sin(this.yaw) * distance,
+      this.target[1] + yOff * distance,
+      this.target[2] + cp * Math.cos(this.yaw) * distance,
+    ];
   }
 
   setFlySpeed(v) {

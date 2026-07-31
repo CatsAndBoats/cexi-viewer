@@ -335,6 +335,15 @@ export function fallOff(distance, near, far) {
   return (far - distance) / (far - near);
 }
 
-/** xim Fps: the engine runs its particle clock at 30 frames per second. */
-export const FPS = 30;
+/**
+ * The FFXI effect engine ticks at 60 frames per second — routines, generators
+ * and particles all on the one clock (FFXIEngine FFXIEffectFacade.cpp:2108
+ * "DeltaSeconds * 60.0f // xim/FFXI internal rate is 60 fps", consumed
+ * unchanged by EffectRoutineInstance and the generators). An earlier port
+ * comment claimed 30 and ran every effect at half speed. Model animation clips
+ * are the exception — they are 30fps and the renderer advances them with their
+ * own literal (see renderer.js animFrame), which is also why scheduler
+ * durations for natural-speed clip playback are written as 2 × clip length.
+ */
+export const FPS = 60;
 export const secondsToFrames = (s) => s * FPS;

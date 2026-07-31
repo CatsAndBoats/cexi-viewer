@@ -154,6 +154,11 @@ function parseRoutine(r, sec) {
   // sequenced phases), not just its first (xim SkeletonAnimationRoutine).
   //   +0 op, +1 u16 sizeWords, +3 unk, +4 u16 delay, +6 u16 duration,
   //   +8 clip ref (4 chars), +24 transIn, +28 transOut, +30 maxLoops
+  //
+  // Delays are RELATIVE, not absolute (header totalDelay == Σ delays on 98.1%
+  // of retail routines, == max on none), and each delay TRAILS its own op —
+  // see the clock note below. Chained clips (ssit: sit-down then sitting
+  // idle) depend on this.
   const commands = [];
   let dur = 0;
   let maxLoops = 0;
@@ -164,10 +169,16 @@ function parseRoutine(r, sec) {
   let p = base + (sec2 - 16);      // body-relative sec2 start, mapped to absolute
   const end = sec.end;
   const u16 = (o) => r.bytes[o] | (r.bytes[o + 1] << 8);
+  // A tag executes immediately; its delay is the wait AFTER it before the next
+  // tag (XiClient CMoSchedulerTask::OnMove: `field_98 += tag.delay; ExecuteTag()`),
+  // so a command starts at the sum of the PRIOR entries' delays only.
+  let clock = 0;
   for (let guard = 0; guard < 128 && p + 8 <= end; guard++) {
     const op = r.bytes[p];
     const n = (r.bytes[p + 1] | (r.bytes[p + 2] << 8)) & 0x1f;
     const entryLen = Math.max(1, n) * 4;
+    const at = clock;
+    if (op !== 0x00) clock += u16(p + 4);
     if (op === 0x05 && p + 32 <= end) {
       const ref = String.fromCharCode(r.bytes[p + 8], r.bytes[p + 9], r.bytes[p + 10], r.bytes[p + 11]);
       if (/^[\x20-\x7e]{4}$/.test(ref)) {
@@ -175,7 +186,7 @@ function parseRoutine(r, sec) {
         refs.push(id);
         commands.push({
           ref: id,
-          delay: u16(p + 4),
+          delay: at,
           duration: u16(p + 6),
           transIn: u16(p + 24),
           transOut: u16(p + 28),
@@ -252,7 +263,10 @@ export function resolveScheduleClip(model, schedule) {
   for (const cmd of schedule.commands ?? []) {
     const clips = (cmd.clipIds ?? []).map((id) => byId.get(id)).filter(Boolean);
     if (clips.length === 0) continue;
-    for (const g of groupAnimations(clips)) segments.push({ clip: g.clip, delay: cmd.delay ?? 0, transOut: cmd.transOut ?? 0 });
+    // Scheduler delays are 1/60s ticks; segment starts are 30fps clip frames.
+    // Retail writes a chained clip's delay as the previous clip's window
+    // (2 × its frame count), so ÷2 makes chains seamless (see effect.js).
+    for (const g of groupAnimations(clips)) segments.push({ clip: g.clip, delay: (cmd.delay ?? 0) / 2, transOut: cmd.transOut ?? 0 });
   }
 
   // Fallback for routines whose commands didn't resolve (older/odd layouts).

@@ -187,9 +187,31 @@ DISPLAY_ROT.m[0] = -1; DISPLAY_ROT.m[5] = -1; DISPLAY_ROT.m[10] = 1;
  */
 const FLARE_NDC_PER_UNIT = 1 / 16;
 
-/** xim Matrix4f.lookAtNegZ upper 3×3 — diag(−1, 1, −1). */
+/** Near-plane escape factor for screen-anchored (camera-space) particles. */
+const OVERLAY_SCALE = 50;
+
+/**
+ * xim Matrix4f.lookAtNegZ upper 3×3 is diag(−1, 1, −1) — a 180° turn about Y,
+ * det +1. It is expressed in xim's camera space, which is Y-down like the rest
+ * of that engine; ours is Y-up.
+ *
+ * The XYZ billboard *replaces* the model-view 3×3 outright, so unlike the
+ * mesh/None path it never sees the DISPLAY_ROT that maps DAT space into our
+ * display space. It therefore has to carry that mapping itself:
+ *
+ *     DISPLAY_ROT · lookAtNegZ = diag(−1,−1,1) · diag(−1,1,−1) = diag(1, −1, −1)
+ *
+ * det stays +1, so this is still a pure rotation (180° about X). That matters:
+ * negating Y alone gives diag(−1,−1,−1), det −1, which is a *reflection* — it
+ * puts the text the right way up but back-to-front, so the sprite reads as
+ * "Level Up!!" and "!!pU leveL" superimposed. Check the determinant, not just
+ * which way is up.
+ *
+ * Sanity check against the real lvu1 quad (image-left at local −X, image-top at
+ * local −Y): local (−8,−2) → camera (−8,+2) = screen left/top. Correct.
+ */
 const LOOK_AT_NEG_Z = new Mat4();
-LOOK_AT_NEG_Z.m[0] = -1; LOOK_AT_NEG_Z.m[5] = 1; LOOK_AT_NEG_Z.m[10] = -1;
+LOOK_AT_NEG_Z.m[0] = 1; LOOK_AT_NEG_Z.m[5] = -1; LOOK_AT_NEG_Z.m[10] = -1;
 
 export class ParticleDrawer {
   constructor(gl) {
@@ -398,6 +420,28 @@ export class ParticleDrawer {
     if (!contexts.length) return;
 
     const viewMat = new Mat4(new Float32Array(view));
+
+    // Static view for screen-anchored particles (localPositionInCameraSpace):
+    // the camera's translation with NO rotation, looking fixed display −Z. xim
+    // renders these through a StaticCamera at the viewer's position (radiance
+    // FFXIEffectFacade:2195) so rank emblems and heat-haze panels hold their
+    // place on screen instead of swinging with the orbit. eye = −Rᵀ·t off the
+    // live view.
+    const vm = viewMat.m;
+    const ex = -(vm[0] * vm[12] + vm[1] * vm[13] + vm[2] * vm[14]);
+    const ey = -(vm[4] * vm[12] + vm[5] * vm[13] + vm[6] * vm[14]);
+    const ez = -(vm[8] * vm[12] + vm[9] * vm[13] + vm[10] * vm[14]);
+    // Rotation diag(−1,1,−1) — xim's lookAtNegZ used RAW, not composed with
+    // DISPLAY_ROT the way the billboard constant is: the DISPLAY-composed form
+    // diag(1,−1,−1) x-mirrored the sprite LAYOUT ("RANK 3" read "3 KNAR" —
+    // glyphs looked fine because XYZ billboarding replaces the rotation block,
+    // so only the translations mirrored). Empirically pinned on that text:
+    // screen-x = +DAT-x, DAT +Z in front, det +1. An identity rotation is also
+    // wrong — it puts the +Z offsets behind the camera (w < 0, nothing drawn).
+    const staticView = new Mat4();
+    staticView.m[0] = -1; staticView.m[5] = 1; staticView.m[10] = -1;
+    staticView.m[12] = ex; staticView.m[13] = -ey; staticView.m[14] = ez;
+
     const commands = [];
     const flares = [];
 
@@ -421,10 +465,24 @@ export class ParticleDrawer {
       particle.getWorldSpaceTransform().multiply(particle.getParticleSpaceOrientationTransform(), model);
       DISPLAY_ROT.multiply(model, model);
 
+      const cameraSpace = particle.config.localPositionInCameraSpace;
+      const activeView = cameraSpace ? staticView : viewMat;
       const modelView = new Mat4();
-      viewMat.multiply(model, modelView);
+      activeView.multiply(model, modelView);
 
-      this.#applyBillboard(particle, viewMat, modelView);
+      this.#applyBillboard(particle, activeView, modelView);
+
+      // Screen overlays are authored millimetres from the eye — Bastok Rank's
+      // sprites sit 0.02 units out, inside the 0.05 near plane, so they clipped
+      // to nothing. Uniformly scaling the finished camera-space transform is
+      // invisible under perspective (x/z, y/z unchanged) but moves them past
+      // the near plane. Done AFTER the billboard, which replaces the rotation
+      // block and would otherwise shed the scale — position ×50 with geometry
+      // at ×1 renders as sub-pixel dots.
+      if (cameraSpace) {
+        const m = modelView.m;
+        for (let i = 0; i < 15; i++) if ((i & 3) !== 3) m[i] *= OVERLAY_SCALE;
+      }
 
       const textureFactor = particle.getColor().withMultipliedAlpha(opacity).clamp();
       const distance = Math.hypot(modelView.m[12], modelView.m[13], modelView.m[14]);
@@ -677,11 +735,21 @@ export class ParticleDrawer {
       LOOK_AT_NEG_Z.multiply(particleTransform, out);
       modelView.copyUpperLeft(out);
     } else if (type === 'XZ') {
-      // Keep the view's up axis, take everything else from the particle.
+      // Keep the view's up axis, take everything else from the particle. The up
+      // column is negated for the same reason LOOK_AT_NEG_Z is built from
+      // DISPLAY_ROT · lookAtNegZ: this path also replaces the model-view
+      // rotation, so it must carry the DAT→display Y flip itself, or the sprite
+      // is drawn upside down.
+      //
+      // Z is negated too, purely to keep the basis right-handed (det +1). With
+      // only Y flipped the matrix is a reflection; that is invisible on a flat
+      // sprite quad, whose vertices all sit at z = 0, but it mirrors any
+      // XZ-billboarded *3D* particle mesh.
       const transform = new Mat4();
-      transform.m[4] = viewMat.m[4];
-      transform.m[5] = viewMat.m[5];
-      transform.m[6] = viewMat.m[6];
+      transform.m[4] = -viewMat.m[4];
+      transform.m[5] = -viewMat.m[5];
+      transform.m[6] = -viewMat.m[6];
+      transform.m[10] = -1;
       const billboard = new Mat4();
       transform.multiply(particleTransform, billboard);
       modelView.copyUpperLeft(billboard);

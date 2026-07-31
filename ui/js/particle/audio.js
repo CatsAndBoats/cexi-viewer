@@ -93,6 +93,11 @@ export class WeatherAudio {
     this._pending = null;        // soundId currently being loaded
     this._buffers = new Map();   // soundId -> { buffer, loopStart } | null
     this._lastKey = null;
+    // Every one-shot handed out by play(). Without this, stopAll() only silenced
+    // the ambient bed and a fired one-shot ran to completion no matter what —
+    // so switching effect (or view) left the previous effect's sounds playing
+    // over the new one, which reads as a sound firing at a wild delay.
+    this._oneShots = [];
   }
 
   attach(system, environment) {
@@ -117,6 +122,20 @@ export class WeatherAudio {
     this._current?.voice.stop();
     this._current = null;
     this._lastKey = null;
+    this.stopOneShots();
+  }
+
+  /**
+   * Cancel every one-shot without touching the ambient bed — what changing the
+   * effect (or its schedule) needs, so the outgoing effect takes its sounds with
+   * it. Covers both routine-scheduled sounds and particle-attached emitters,
+   * since every voice is handed out by play(). Handles whose buffer is still
+   * decoding are cancelled too: the `stopped` flag makes play() drop them when
+   * the decode lands.
+   */
+  stopOneShots() {
+    for (const h of this._oneShots) h.stop();
+    this._oneShots.length = 0;
   }
 
   /**
@@ -186,6 +205,13 @@ export class WeatherAudio {
     this._current = { soundId, voice };
   }
 
+  /**
+   * Pre-decode a sound so its first play() starts on the scheduled frame. A
+   * cold one-shot pays file read + decode at fire time — enough lag to make a
+   * correctly-timed impact sound land audibly late.
+   */
+  warm(soundId) { return this._buffer(soundId); }
+
   async _buffer(soundId) {
     if (this._buffers.has(soundId)) return this._buffers.get(soundId);
     let sound = null;
@@ -221,6 +247,8 @@ export class WeatherAudio {
       handle.voice = new Voice(ctx, sound, { looping, volume: this.volume * attenuation });
     });
 
+    this._oneShots = this._oneShots.filter((h) => !h.isComplete());
+    this._oneShots.push(handle);
     return handle;
   }
 }
