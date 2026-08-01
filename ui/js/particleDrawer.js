@@ -515,14 +515,20 @@ export class ParticleDrawer {
       this.#setBlend(p.blendFunc, p.isDistortion());
       gl.depthMask(!!config.depthMask);
 
-      // Depth bias (xim Notes[Sec 0x30]): a small projection nudge that falls off
-      // with distance. lowPriorityDraw pushes the sea back hard so shoreline
-      // effects composite over it instead of z-fighting.
-      const depthBias = config.lowPriorityDraw ? -0.1
-        : config.drawPriorityOffset ? -0.01
-          : p.projectionBias.param0;
+      // Projection-matrix depth nudge (tiny epsilon). Opcode 0x30's param0 is
+      // dual-use in the DAT: fire/sparks store real epsilons (~-0.2…0.2) while
+      // sea/foam store painter-sort weights in the hundreds/thousands (Valkurm
+      // uma1 = 8290). Feeding those weights into proj[14] yanks the plane behind
+      // the far plane — water vanishes. Large values stay in #priority only.
+      let depthNudge = 0;
+      if (config.lowPriorityDraw) depthNudge = -0.1;
+      else if (config.drawPriorityOffset) depthNudge = -0.01;
+      else {
+        const b = p.projectionBias.param0;
+        if (Number.isFinite(b) && Math.abs(b) <= 1) depthNudge = b;
+      }
       const d = cmd.distance <= 30 ? cmd.distance : 30 + Math.sqrt(cmd.distance - 30);
-      projMat[14] = baseProj14 + (depthBias * 0.03) * Math.pow(0.5, d / 5);
+      projMat[14] = baseProj14 + (depthNudge * 0.03) * Math.pow(0.5, d / 5);
       gl.uniformMatrix4fv(this.u.proj, false, projMat);
 
       gl.uniformMatrix4fv(this.u.model, false, cmd.model.m);
