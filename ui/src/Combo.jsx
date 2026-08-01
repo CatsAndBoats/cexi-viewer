@@ -1,4 +1,4 @@
-import { useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
   Combobox, ComboboxButton, ComboboxInput, ComboboxOption, ComboboxOptions,
   Listbox, ListboxButton, ListboxOption, ListboxOptions,
@@ -11,6 +11,10 @@ import {
 // what you typed). Long lists — gear runs to several hundred entries per slot —
 // switch to a Combobox whose trigger is a filter field, because prefix-only
 // typeahead inside a 350 ms window can't find "Melee Cyclas (MNK Relic)".
+//
+// Weapon slots pass `groupByType`: the panel opens on weapon types (Hand,
+// Katana, …), then drills into that type's list. Typing always searches the
+// full list so a name still works from the type screen.
 const SEARCH_MIN = 12;
 
 /**
@@ -57,6 +61,52 @@ function optionRows(items, Option) {
         </Option>
       ),
   );
+}
+
+function filterItems(items, query) {
+  const q = query.trim().toLowerCase();
+  if (!q) return items;
+  // Every term has to land somewhere, so "relic cyclas" finds "Melee Cyclas
+  // (MNK Relic)" however the words are ordered.
+  const terms = q.split(/\s+/);
+  return items.filter((it) => {
+    const hay = `${it.label} ${it.group ?? ''}`.toLowerCase();
+    return terms.every((t) => hay.includes(t));
+  });
+}
+
+/** Ordered unique group names; skips blank and dash-rule placeholders. */
+function listGroups(items) {
+  const order = [];
+  const seen = new Set();
+  for (const it of items) {
+    const g = it.group;
+    if (!g || g.startsWith('---') || seen.has(g)) continue;
+    seen.add(g);
+    order.push(g);
+  }
+  return order;
+}
+
+/**
+ * Fold ungrouped gear into a "Standard" type so armor (hundreds of plain pieces
+ * + Artifact/Relic/…) gets the same type → item drill-down as weapons. "None"
+ * stays ungrouped and pins above the type list.
+ */
+const STANDARD_GROUP = 'Standard';
+
+function normalizeTypeItems(items) {
+  let needsStandard = false;
+  for (const it of items) {
+    if (it.label.toLowerCase() === 'none') continue;
+    if (!it.group || it.group.startsWith('---')) { needsStandard = true; break; }
+  }
+  if (!needsStandard) return items;
+  return items.map((it) => {
+    if (it.label.toLowerCase() === 'none') return it.group ? { ...it, group: null } : it;
+    if (!it.group || it.group.startsWith('---')) return { ...it, group: STANDARD_GROUP };
+    return it;
+  });
 }
 
 /**
@@ -110,17 +160,7 @@ function SearchCombo({ value, items, onChange, placeholder, className }) {
   const [trigger, panelStyle] = useTriggerWidth();
   const label = items.find((i) => i.id === value)?.label ?? '';
 
-  const shown = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    if (!q) return items;
-    // Every term has to land somewhere, so "relic cyclas" finds "Melee Cyclas
-    // (MNK Relic)" however the words are ordered.
-    const terms = q.split(/\s+/);
-    return items.filter((it) => {
-      const hay = `${it.label} ${it.group ?? ''}`.toLowerCase();
-      return terms.every((t) => hay.includes(t));
-    });
-  }, [items, query]);
+  const shown = useMemo(() => filterItems(items, query), [items, query]);
 
   return (
     <Combobox
@@ -174,10 +214,158 @@ function SearchCombo({ value, items, onChange, placeholder, className }) {
   );
 }
 
-export function Combo({ value, items, onChange, placeholder = '—', className = '', searchable }) {
+/**
+ * Two-step picker: types first (Hand / Katana / Artifact / …), then items in
+ * that type. Open lands on the selected item's type so sibling swaps are one
+ * click; the back row returns to types. Typing on the type screen searches all.
+ */
+function GroupedSearchCombo({ value, items: rawItems, onChange, placeholder, className }) {
+  const items = useMemo(() => normalizeTypeItems(rawItems), [rawItems]);
+  const [query, setQuery] = useState('');
+  // null = type list; string = that group's items.
+  const [scope, setScope] = useState(null);
+  const [open, setOpen] = useState(false);
+  const wasOpen = useRef(false);
+  const [trigger, panelStyle] = useTriggerWidth();
+  const current = items.find((i) => i.id === value);
+  const label = current?.label ?? '';
+  const currentGroup = current?.group && !current.group.startsWith('---') ? current.group : null;
+
+  const groups = useMemo(() => listGroups(items), [items]);
+  const counts = useMemo(() => {
+    const m = new Map();
+    for (const it of items) {
+      if (!it.group || it.group.startsWith('---')) continue;
+      m.set(it.group, (m.get(it.group) ?? 0) + 1);
+    }
+    return m;
+  }, [items]);
+
+  // "None" (and any leftover ungrouped) sit above the type list.
+  const loose = useMemo(
+    () => items.filter((it) => !it.group || it.group.startsWith('---')),
+    [items],
+  );
+
+  const searching = query.trim().length > 0;
+
+  const shown = useMemo(() => {
+    if (scope == null) {
+      // Type screen: typing searches every item so a name still works.
+      return searching ? filterItems(items, query) : loose;
+    }
+    const inType = items.filter((it) => it.group === scope);
+    return searching ? filterItems(inType, query) : inType;
+  }, [items, loose, query, scope, searching]);
+
+  // Seed scope each time the panel opens.
+  useEffect(() => {
+    if (open && !wasOpen.current) {
+      setScope(currentGroup);
+      setQuery('');
+    }
+    wasOpen.current = open;
+  }, [open, currentGroup]);
+
+  const ph = !open
+    ? placeholder
+    : scope
+      ? `Filter ${scope}…`
+      : 'Type or search…';
+
+  // Type menu only when not drilled in and not mid-search.
+  const showTypes = scope == null && !searching;
+  const showItems = scope != null || searching;
+
+  return (
+    <Combobox
+      value={value ?? ''}
+      onChange={(id) => { if (id != null) onChange(id); }}
+      onClose={() => { setQuery(''); setScope(null); setOpen(false); }}
+    >
+      {({ open: isOpen }) => (
+        <div
+          style={{ display: 'contents' }}
+          onKeyDownCapture={(e) => cycleOnArrow(e, isOpen, items.map((i) => i.id), value, onChange)}
+        >
+          <OpenTracker open={isOpen} onOpen={setOpen} />
+          <ComboboxButton as="div" ref={trigger} className={`combo-input${className ? ` ${className}` : ''}`}>
+            <ComboboxInput
+              className="combo-value combo-search"
+              autoComplete="off"
+              spellCheck="false"
+              displayValue={() => (isOpen ? '' : label)}
+              placeholder={ph}
+              defaultValue={label}
+              onChange={(e) => setQuery(e.target.value)}
+              onKeyDown={(e) => e.stopPropagation()}
+            />
+            <span className="icon combo-chevron">unfold_more</span>
+          </ComboboxButton>
+          <ComboboxOptions anchor="bottom start" className="combo-options combo-options-typed" style={panelStyle}>
+            {scope != null && (
+              <button
+                type="button"
+                className="combo-back"
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={(e) => { e.preventDefault(); e.stopPropagation(); setScope(null); setQuery(''); }}
+              >
+                <span className="icon">chevron_left</span>
+                {scope}
+              </button>
+            )}
+            {showTypes && (
+              <>
+                {loose.length > 0 && optionRows(loose, ComboboxOption)}
+                {groups.map((g) => {
+                  const active = currentGroup === g;
+                  return (
+                    <button
+                      key={g}
+                      type="button"
+                      className={`combo-type${active ? ' on' : ''}`}
+                      onMouseDown={(e) => e.preventDefault()}
+                      onClick={(e) => { e.preventDefault(); e.stopPropagation(); setScope(g); }}
+                    >
+                      <span className="combo-type-name">{g}</span>
+                      <span className="combo-type-count">{counts.get(g) ?? 0}</span>
+                    </button>
+                  );
+                })}
+              </>
+            )}
+            {showItems && (
+              shown.length === 0
+                ? <div className="combo-empty">No match</div>
+                : optionRows(shown, ComboboxOption)
+            )}
+          </ComboboxOptions>
+        </div>
+      )}
+    </Combobox>
+  );
+}
+
+/** Mirrors Headless open state into React state without setState-during-render. */
+function OpenTracker({ open, onOpen }) {
+  useEffect(() => { onOpen(open); }, [open, onOpen]);
+  return null;
+}
+
+export function Combo({ value, items, onChange, placeholder = '—', className = '', searchable, groupByType = false }) {
+  const groups = useMemo(
+    () => (groupByType ? listGroups(normalizeTypeItems(items)) : []),
+    [groupByType, items],
+  );
+  if (groupByType && groups.length >= 2) {
+    return (
+      <GroupedSearchCombo value={value} items={items} onChange={onChange}
+        placeholder={placeholder} className={className} />
+    );
+  }
   const Impl = (searchable ?? items.length >= SEARCH_MIN) ? SearchCombo : PlainCombo;
   return (
     <Impl value={value} items={items} onChange={onChange}
-          placeholder={placeholder} className={className} />
+      placeholder={placeholder} className={className} />
   );
 }

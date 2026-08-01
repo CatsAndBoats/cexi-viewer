@@ -37,14 +37,14 @@ const MENUS = [
     items: [
       { id: 'assets-files', label: 'File Browser', icon: 'folder_open' },
       { id: 'assets-data', label: 'Data', icon: 'database' },
-      { id: 'assets-images', label: 'Images', icon: 'image' },
-      { id: 'assets-scene', label: 'Scene', icon: 'grass' },
-      { id: 'assets-zones', label: 'Zones', icon: 'map' },
-      { id: 'assets-npcs', label: 'NPCs', icon: 'pets' },
       { id: 'assets-characters', label: 'Characters', icon: 'person' },
+      { id: 'assets-npcs', label: 'NPCs', icon: 'pets' },
+      { id: 'assets-zones', label: 'Zones', icon: 'map' },
       { id: 'assets-effects', label: 'Effects', icon: 'auto_awesome' },
+      { id: 'assets-images', label: 'Images', icon: 'image' },
       { id: 'assets-music', label: 'Music', icon: 'music_note' },
       { id: 'assets-sfx', label: 'Sound FX', icon: 'graphic_eq' },
+      { id: 'assets-scene', label: 'Scene', icon: 'grass' },
     ],
   },
 ];

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Combo } from './Combo.jsx';
 import { Tooltip } from './Tooltip.jsx';
 
@@ -138,10 +138,48 @@ function buildLookHex(race, sel, slots, raceInfo) {
  * and the left panel share one instance.
  */
 const PC_STATE_KEY = 'pcState';
+const GEARSETS_KEY = 'pcGearSets';
 
 /** Persisted composer selections: { race, sel, actionGroup, action }. */
 function loadPcState() {
   try { return JSON.parse(localStorage.getItem(PC_STATE_KEY) || 'null') ?? {}; } catch { return {}; }
+}
+
+/**
+ * Gear set library (localStorage → app data in the Tauri shell).
+ * sets: { id, name, race, gear: { slotKey: label } }
+ */
+function loadGearSets() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(GEARSETS_KEY) || 'null');
+    if (!raw) return [];
+    // v1 had folders — keep every set, drop folder metadata.
+    if (Array.isArray(raw.sets)) return raw.sets.map(({ id, name, race, gear, updatedAt }) => (
+      { id, name, race, gear, updatedAt }
+    )).filter((s) => s?.id && s?.name && s?.race && s?.gear);
+    if (Array.isArray(raw)) return raw;
+    return [];
+  } catch {
+    return [];
+  }
+}
+
+function saveGearSets(sets) {
+  try { localStorage.setItem(GEARSETS_KEY, JSON.stringify({ version: 2, sets })); } catch { /* quota */ }
+}
+
+function newId(prefix) {
+  return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
+}
+
+/** Snapshot the current look as race + per-slot item labels (portable across races/rebakes). */
+function snapshotLoadout(race, sel, slots) {
+  const gear = {};
+  for (const s of SLOTS) {
+    const it = slots?.[s.key]?.find((x) => x.id === sel[s.key]);
+    if (it) gear[s.key] = it.label;
+  }
+  return { race, gear };
 }
 
 export function useCharacter({ enabled, onLoad, onError }) {
@@ -161,6 +199,7 @@ export function useCharacter({ enabled, onLoad, onError }) {
   const lastRace = useRef('');                  // race of the last onLoad (camera keep)
   const restored = useRef(false);               // saved selections applied?
   const carry = useRef({ gear: {}, actionKey: null });   // selections to carry across a race switch
+  const pendingGear = useRef(null);             // gear-set labels to apply after race/slots ready
   const prevSelRef = useRef(null);              // sel snapshot from the last onLoad (for displayPath)
   const raceData = useRef(new Map());           // race id -> full characters.json entry
   const prevEnabled = useRef(false);
@@ -243,13 +282,25 @@ export function useCharacter({ enabled, onLoad, onError }) {
 
     // Restore the saved selections once, and only for the race they belong to
     // (gear lists are race-specific; a manual race switch carries by label).
+    // A pending gear-set load wins over both (labels applied after slots exist).
     const s = saved.current;
     const restoring = !restored.current && s.race === race;
     restored.current = true;
     const startSel = { ...defaults };
     let startGroup = acts[0]?.group ?? (acts.length ? 'Other' : '');
     let startAction = acts[0]?.id ?? '';
-    if (restoring) {
+    const applyLabels = (labels) => {
+      if (!labels) return;
+      for (const s2 of SLOTS) {
+        const want = labels[s2.key];
+        const hit = want && slotMap[s2.key]?.find((it) => it.label === want);
+        if (hit) startSel[s2.key] = hit.id;
+      }
+    };
+    if (pendingGear.current) {
+      applyLabels(pendingGear.current);
+      pendingGear.current = null;
+    } else if (restoring) {
       for (const [k, id] of Object.entries(s.sel ?? {})) {
         if (slotMap[k]?.some((it) => it.id === id)) startSel[k] = id;
       }
@@ -257,11 +308,7 @@ export function useCharacter({ enabled, onLoad, onError }) {
       if (act) { startGroup = act.group ?? 'Other'; startAction = act.id; }
     } else if (carry.current.actionKey || Object.keys(carry.current.gear).length) {
       // Race switch: carry gear + action over by label (item ids differ per race).
-      for (const s2 of SLOTS) {
-        const want = carry.current.gear[s2.key];
-        const hit = want && slotMap[s2.key]?.find((it) => it.label === want);
-        if (hit) startSel[s2.key] = hit.id;
-      }
+      applyLabels(carry.current.gear);
       const [g, l] = (carry.current.actionKey ?? '').split('|');
       const act = acts.find((a) => (a.group ?? '') === g && a.label === l);
       if (act) { startGroup = act.group ?? 'Other'; startAction = act.id; }
@@ -364,16 +411,49 @@ export function useCharacter({ enabled, onLoad, onError }) {
     lastRace.current = race;
   }, [enabled, races, race, slots, slotsRace, sel, actions, action]);
 
+  /** Apply a saved gear set (race + slot labels). Switches race if needed. */
+  const applyGearSet = useCallback((entry) => {
+    if (!entry?.race || !entry.gear) return;
+    if (!raceData.current.has(entry.race)) {
+      cbRef.current.onError?.(`Gear set race “${entry.race}” is not available.`);
+      return;
+    }
+    if (entry.race !== race) {
+      pendingGear.current = entry.gear;
+      setSlotsRace('');
+      lastKey.current = '';
+      lastRace.current = '';
+      prevSelRef.current = null;
+      setRaceState(entry.race);
+      return;
+    }
+    // Same race — map labels → ids on the live slot lists.
+    if (!slots || slotsRace !== race) {
+      pendingGear.current = entry.gear;
+      return;
+    }
+    setSel((prev) => {
+      const next = { ...prev };
+      for (const s of SLOTS) {
+        const want = entry.gear[s.key];
+        const hit = want && slots[s.key]?.find((it) => it.label === want);
+        if (hit) next[s.key] = hit.id;
+      }
+      return next;
+    });
+  }, [race, slots, slotsRace]);
+
   return {
     races, race, setRace, slots, sel, setSel,
     actionGroups, actionGroup, setActionGroup, actionEntries, action, setAction,
+    applyGearSet,
   };
 }
 
 // ---------------------------------------------------------------------------
 
 export function CharacterList({ pc }) {
-  const { races, race, setRace, slots, sel, setSel } = pc;
+  const { races, race, setRace, slots, sel, setSel, applyGearSet } = pc;
   const raceItems = (races ?? []).map((r) => ({ id: r.id, label: r.label }));
   const pick = (key) => (id) => setSel((s) => ({ ...s, [key]: id }));
 
@@ -392,10 +472,12 @@ export function CharacterList({ pc }) {
   const slotCtrl = (s) => {
     const items = slots?.[s.key];
     if (!items?.length) return null;
+    // Weapon + armor: type first (Katana / Artifact / …), then the piece.
+    const typed = s.section === 'Weapon' || s.section === 'Armor';
     return (
       <div className="pc-ctrl" key={s.key}>
         <span className="pc-ctrl-label">{s.label}</span>
-        <Combo value={sel[s.key]} items={items} onChange={pick(s.key)} />
+        <Combo value={sel[s.key]} items={items} onChange={pick(s.key)} groupByType={typed} />
       </div>
     );
   };
@@ -444,12 +526,143 @@ export function CharacterList({ pc }) {
                 </div>
               </>
             )}
+            <GearSetsPanel
+              race={race}
+              sel={sel}
+              slots={slots}
+              races={races}
+              onApply={applyGearSet}
+            />
           </>
         )}
       </div>
-      <div className="pc-footer">
-        <div className="side-separator">GearSets</div>
-        <div className="side-note">Work in progress.</div>
+    </div>
+  );
+}
+
+// ── Gear sets (flat saved looks) ─────────────────────────────────────────────
+
+function GearSetsPanel({ race, sel, slots, races, onApply }) {
+  const [sets, setSets] = useState(loadGearSets);
+  const [activeSet, setActiveSet] = useState(null);
+  const [draft, setDraft] = useState('');
+  // null | 'save' | { rename: id }
+  const [mode, setMode] = useState(null);
+  const draftRef = useRef(null);
+
+  const persist = (next) => {
+    setSets(next);
+    saveGearSets(next);
+  };
+
+  useEffect(() => {
+    if (mode && draftRef.current) {
+      draftRef.current.focus();
+      draftRef.current.select?.();
+    }
+  }, [mode]);
+
+  const raceLabel = (id) => races.find((r) => r.id === id)?.label ?? id;
+
+  const beginSave = () => { setMode('save'); setDraft(''); };
+  const beginRename = (id, name) => { setMode({ rename: id }); setDraft(name); };
+  const cancelMode = () => { setMode(null); setDraft(''); };
+
+  const commitDraft = () => {
+    const name = draft.trim();
+    if (!name) { cancelMode(); return; }
+    if (mode === 'save') {
+      const snap = snapshotLoadout(race, sel, slots);
+      const entry = {
+        id: newId('set'),
+        name,
+        race: snap.race,
+        gear: snap.gear,
+        updatedAt: Date.now(),
+      };
+      persist([...sets, entry]);
+      setActiveSet(entry.id);
+      cancelMode();
+      return;
+    }
+    if (mode?.rename) {
+      persist(sets.map((s) => (s.id === mode.rename ? { ...s, name } : s)));
+      cancelMode();
+    }
+  };
+
+  const deleteSet = (id) => {
+    persist(sets.filter((s) => s.id !== id));
+    if (activeSet === id) setActiveSet(null);
+  };
+
+  const overwriteSet = (id) => {
+    const snap = snapshotLoadout(race, sel, slots);
+    persist(sets.map((s) => (s.id === id
+      ? { ...s, race: snap.race, gear: snap.gear, updatedAt: Date.now() }
+      : s)));
+  };
+
+  return (
+    <div className="gs-panel">
+      <div className="gs-head">
+        <span className="gs-title">GearSets</span>
+        <span className="gs-spacer" />
+        <button type="button" className="gs-save" onClick={beginSave}>Save</button>
+      </div>
+
+      {(mode === 'save' || mode?.rename) && (
+        <form className="gs-draft" onSubmit={(e) => { e.preventDefault(); commitDraft(); }}>
+          <input
+            ref={draftRef}
+            className="gs-draft-input"
+            value={draft}
+            placeholder={mode === 'save' ? 'Name' : 'Rename'}
+            onChange={(e) => setDraft(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Escape') cancelMode(); }}
+          />
+          <Tooltip content="Confirm" placement="left">
+            <button type="submit" className="gs-tool" aria-label="Confirm"><span className="icon">check</span></button>
+          </Tooltip>
+          <Tooltip content="Cancel" placement="left">
+            <button type="button" className="gs-tool" aria-label="Cancel" onClick={cancelMode}><span className="icon">close</span></button>
+          </Tooltip>
+        </form>
+      )}
+
+      <div className="gs-list">
+        {sets.length === 0 && !mode && (
+          <div className="gs-empty">Save the current look to add a gear set.</div>
+        )}
+        {sets.map((s) => (
+          <div
+            key={s.id}
+            className={`gs-row${activeSet === s.id ? ' on' : ''}`}
+            onClick={() => { setActiveSet(s.id); onApply(s); }}
+            onDoubleClick={(e) => { e.stopPropagation(); beginRename(s.id, s.name); }}
+          >
+            <span className="icon gs-kind">person</span>
+            <span className="gs-name">{s.name}</span>
+            <span className="gs-meta">{raceLabel(s.race)}</span>
+            <span className="gs-acts" onClick={(e) => e.stopPropagation()} onMouseDown={(e) => e.stopPropagation()}>
+              <Tooltip content="Overwrite with current look" placement="top" delay={[250, 0]}>
+                <button type="button" className="gs-tool" aria-label="Overwrite" onClick={() => overwriteSet(s.id)}>
+                  <span className="icon">sync</span>
+                </button>
+              </Tooltip>
+              <Tooltip content="Rename" placement="top" delay={[250, 0]}>
+                <button type="button" className="gs-tool" aria-label="Rename" onClick={() => beginRename(s.id, s.name)}>
+                  <span className="icon">edit</span>
+                </button>
+              </Tooltip>
+              <Tooltip content="Delete" placement="top" delay={[250, 0]}>
+                <button type="button" className="gs-tool" aria-label="Delete" onClick={() => deleteSet(s.id)}>
+                  <span className="icon">close</span>
+                </button>
+              </Tooltip>
+            </span>
+          </div>
+        ))}
       </div>
     </div>
   );
