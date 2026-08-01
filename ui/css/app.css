@@ -1568,3 +1568,38 @@ input[type='color'] {
   color: #0b1420;
 }
 .data-census-sep { height: 1px; margin: 6px 12px; background: var(--ring); }
+
+/* Data view — zone script DATs (NPC list / events / dialog) */
+.data-zone-tag {
+  margin-left: 6px;
+  color: var(--gray-300);
+  font-weight: 500; text-transform: none; letter-spacing: 0;
+}
+.data-ev-badge {
+  font-size: 10px;
+  color: var(--gray-300);
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 999px;
+  padding: 1px 7px;
+}
+.data-op-row { padding-left: 44px; font-size: 11px; }
+.data-op-off { color: var(--gray-600); flex: 0 0 36px; }
+.data-op-hex { color: var(--gray-500); flex: 0 0 20px; }
+.data-op-name { color: var(--gray-200); flex: 0 0 130px; }
+.data-op-extra {
+  flex: 1 1 auto; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis;
+  color: var(--muted); font-size: 11px;
+}
+.data-dlg-entry { padding: 5px 12px 6px 8px; border-bottom: 1px solid var(--ring); }
+.data-dlg-entry:hover { background: rgba(255, 255, 255, 0.04); }
+.data-dlg-head { display: flex; align-items: baseline; gap: 8px; }
+.data-dlg-speaker { color: var(--accent); font-size: 12px; font-weight: 500; }
+.data-dlg-text {
+  margin: 2px 0 0 72px;
+  color: var(--gray-200);
+  font-size: 12px; line-height: 1.5;
+  white-space: pre-wrap;
+  user-select: text;
+}
+.data-dlg-empty { color: var(--gray-600); font-style: italic; }

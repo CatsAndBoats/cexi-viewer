@@ -316,6 +316,36 @@ export class OrbitCamera {
     }
   }
 
+  /** Serializable pose for restore (zone re-open, HD reload). */
+  snapshot() {
+    return {
+      mode: this.mode,
+      target: this.target.slice(),
+      pos: this.pos.slice(),
+      yaw: this.yaw,
+      pitch: this.pitch,
+      distance: this.distance,
+      flySpeed: this.flySpeed,
+    };
+  }
+
+  /** Apply a snapshot after setRangeFor so limits/yUp match the content kind. */
+  restore(snap) {
+    if (!snap) return;
+    if (Array.isArray(snap.target) && snap.target.length === 3) this.target = snap.target.slice();
+    if (Array.isArray(snap.pos) && snap.pos.length === 3) this.pos = snap.pos.slice();
+    if (Number.isFinite(snap.yaw)) this.yaw = snap.yaw;
+    if (Number.isFinite(snap.pitch)) this.pitch = snap.pitch;
+    if (Number.isFinite(snap.distance)) {
+      this.distance = Math.min(Math.max(snap.distance, this.minDistance), this.maxDistance);
+    }
+    if (Number.isFinite(snap.flySpeed)) {
+      this.flySpeed = Math.min(FLY_SPEED_MAX, Math.max(FLY_SPEED_MIN, snap.flySpeed));
+    }
+    // Assign mode directly — setMode() would re-derive eye/look from the old pose.
+    this.mode = snap.mode === 'fly' ? 'fly' : 'orbit';
+  }
+
   /** Frame an AABB. Optional `opts.distance` overrides the auto radius framing. */
   fit(min, max, opts = {}) {
     this.target = [(min[0] + max[0]) / 2, (min[1] + max[1]) / 2, (min[2] + max[2]) / 2];

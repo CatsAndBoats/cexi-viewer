@@ -48,6 +48,11 @@ export function SettingsModal({ open, initial, onSave, onClose, error }) {
     if (picked) setDraft({ ...draft, gamePath: picked });
   };
 
+  const browseHd = async () => {
+    const picked = await backend.pickFolder(draft.hdPath || draft.gamePath);
+    if (picked) setDraft({ ...draft, hdPath: picked });
+  };
+
   const browseCexi = async () => {
     const picked = await backend.pickFile(draft.cexiPath);
     if (picked) setDraft({ ...draft, cexiPath: picked });
@@ -95,6 +100,24 @@ export function SettingsModal({ open, initial, onSave, onClose, error }) {
                 Browse
               </Button>
             </div>
+          </div>
+
+          <div className="form-row">
+            <label className="form-label">HD path</label>
+            <div className="form-inline">
+              <input
+                type="text"
+                value={draft.hdPath ?? ''}
+                spellCheck={false}
+                placeholder="Optional HD pack / high-res install root"
+                onChange={(e) => setDraft({ ...draft, hdPath: e.target.value })}
+              />
+              <Button onClick={browseHd}>
+                <span className="icon">folder_open</span>
+                Browse
+              </Button>
+            </div>
+            <div className="form-hint">When HD is toggled on in the toolbar, files load from here first and fall back to the game path if missing.</div>
           </div>
 
           <div className="form-row">

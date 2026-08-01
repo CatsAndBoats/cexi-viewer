@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Button } from '@headlessui/react';
 import { backend } from '../js/backend.js';
+import { gameCandidates, normRel, relFromAbs } from '../js/gamePath.js';
 import { animDisplayName, groupAnimations, mergeModels, parseEntity, resolveScheduleClip } from '../js/dat.js';
 import { Renderer } from '../js/renderer.js';
 import { FileTree } from './FileTree.jsx';
@@ -38,6 +39,10 @@ import { toAudioBuffer, parseAudioHeader, FMT_ATRAC3 } from '../js/audio.js';
 import { parseImageDat, textureForSet } from '../js/images.js';
 import { inspectDat } from '../js/dat/inspect.js';
 import { matchTablePath, parseFileTable } from '../js/dat/ftable.js';
+import {
+  sniffZoneDat, zoneForFileId, zoneFileIds, parseNpcList, npcNameMap,
+  parseEventDat, parseDialogDat, dialogSpeakers, dialogConversations, EVENT_CATEGORIES,
+} from '../js/dat/zonedat.js';
 import { DataViewer } from './DataViewer.jsx';
 import { ImageList } from './ImageList.jsx';
 import { ImageSetPanel } from './ImageSetPanel.jsx';
@@ -52,6 +57,30 @@ const LAST_DAT_KEY = 'lastDat';
 const LAST_VIEW_KEY = 'lastView';
 const LAST_IMAGE_KEY = 'lastImage';
 const ANIM_SEL_KEY = 'lastAnimSel';
+/** Per-zone camera poses keyed by zone path (lowercase). */
+const ZONE_CAM_KEY = 'zoneCameras';
+
+const zoneCamKey = (zone) => String(zone?.path || zone?.id || '').replace(/\//g, '\\').toLowerCase();
+
+function readZoneCamMap() {
+  try { return JSON.parse(localStorage.getItem(ZONE_CAM_KEY) || '{}') || {}; }
+  catch { return {}; }
+}
+
+function writeZoneCamera(key, snap) {
+  if (!key || !snap) return;
+  try {
+    const map = readZoneCamMap();
+    map[key] = snap;
+    localStorage.setItem(ZONE_CAM_KEY, JSON.stringify(map));
+  } catch { /* quota */ }
+}
+
+function readZoneCamera(key) {
+  if (!key) return null;
+  const snap = readZoneCamMap()[key];
+  return snap && Array.isArray(snap.target) ? snap : null;
+}
 const VIEWS = ['files', 'npc', 'pc', 'music', 'sfx', 'scene', 'zones', 'images', 'effects', 'data'];
 /** Views that browse individual models, where fly controls are a hindrance. */
 const ORBIT_VIEWS = new Set(['files', 'npc', 'pc']);
@@ -103,13 +132,19 @@ const yieldToPaint = () => new Promise((resolve) => {
   setTimeout(finish, 100);
 });
 
-const loadSettings = (gamePath) => ({
-  gamePath,
-  bgColor: localStorage.getItem('bgColor') || DEFAULT_BG,
-  autoPlay: localStorage.getItem('autoPlay') !== '0',
-  autoWasdZones: localStorage.getItem('autoWasdZones') !== '0',
-  cexiPath: localStorage.getItem('cexiPath') || '',
-});
+const loadSettings = (gamePath) => {
+  const hdPath = localStorage.getItem('hdPath') || '';
+  return {
+    gamePath,
+    hdPath,
+    hdEnabled: !!hdPath && localStorage.getItem('hdEnabled') === '1',
+    bgColor: localStorage.getItem('bgColor') || DEFAULT_BG,
+    autoPlay: localStorage.getItem('autoPlay') !== '0',
+    autoWasdZones: localStorage.getItem('autoWasdZones') !== '0',
+    cexiPath: localStorage.getItem('cexiPath') || '',
+  };
+};
+
 
 // Particle-DAT parsers/tree, shared by zone effects and standalone spell/ability
 // DATs so both resolve links (meshes, keyframes, sprites) the same way. Effect
@@ -131,6 +166,119 @@ function buildParticleTree(buffer, parsers, warnings) {
   const bytes = new Uint8Array(buffer);
   const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   return buildDatTree(bytes, dv, parseSections(dv), parsers, (m) => warnings.push(m));
+}
+
+/**
+ * Merged file-id ↔ DAT-path maps across every FTABLE/VTABLE pair (base +
+ * ROM2-10), the way the client resolves them: lowest table wins. Cached in
+ * `cacheRef` — reads ~10 table pairs once per session.
+ */
+async function loadMergedTables(settings, cacheRef) {
+  if (cacheRef.current) return cacheRef.current;
+  const byFid = new Map();
+  const byPath = new Map();
+  for (let rom = 1; rom <= 10; rom++) {
+    const ftRel = rom === 1 ? 'FTABLE.DAT' : `ROM${rom}\\FTABLE${rom}.DAT`;
+    const vtRel = rom === 1 ? 'VTABLE.DAT' : `ROM${rom}\\VTABLE${rom}.DAT`;
+    try {
+      const [ft, vt] = await Promise.all([
+        backend.readPrefer(gameCandidates(ftRel, settings)),
+        backend.readPrefer(gameCandidates(vtRel, settings)),
+      ]);
+      for (const e of parseFileTable(ft.data, vt.data).entries) {
+        if (!byFid.has(e.id)) byFid.set(e.id, e.dat);
+        const key = e.dat.toUpperCase();
+        if (!byPath.has(key)) byPath.set(key, e.id);
+      }
+    } catch { /* expansion not installed */ }
+  }
+  cacheRef.current = { byFid, byPath };
+  return cacheRef.current;
+}
+
+/**
+ * Build the Data-view doc for a zone script DAT (NPC list / events / dialog).
+ * Resolves the zone id from the file id and reads the zone's sibling DATs so
+ * the views can cross-reference: NPC names label event actors, event print
+ * ops attribute dialog lines to speakers, dialog text annotates opcodes.
+ */
+async function buildZoneDatDoc(kind, bytes, relPath, settings, tablesRef) {
+  const { byFid, byPath } = await loadMergedTables(settings, tablesRef);
+  const fid = byPath.get(relPath.replace(/\\/g, '/').toUpperCase()) ?? null;
+  const zone = fid != null ? zoneForFileId(fid) : null;
+  const zoneId = zone?.zoneId ?? null;
+
+  const readSibling = async (sibKind) => {
+    if (zoneId == null) return null;
+    const sibFid = zoneFileIds(zoneId)[sibKind];
+    const dat = byFid.get(sibFid);
+    if (!dat) return null;
+    try {
+      const { data } = await backend.readPrefer(gameCandidates(dat, settings));
+      return new Uint8Array(data);
+    } catch { return null; }
+  };
+
+  let zoneName = null;
+  if (zoneId != null) {
+    try {
+      const zones = await (await fetch('lists/zones.json')).json();
+      zoneName = zones.find((z) => z.id === zoneId)?.name ?? null;
+    } catch { /* baked list unavailable */ }
+  }
+
+  const base = { kind, fileSize: bytes.byteLength, zoneId, zoneName, fileId: fid };
+
+  if (kind === 'npclist') {
+    const npcs = parseNpcList(bytes);
+    // Per-NPC event counts from the zone's event DAT, when it parses.
+    const evBytes = await readSibling('events');
+    if (evBytes) {
+      try {
+        const counts = new Map();
+        for (const a of parseEventDat(evBytes)) counts.set(a.actorId, a.events.length);
+        for (const n of npcs) n.events = counts.get(n.id) ?? 0;
+      } catch { /* names still render without counts */ }
+    }
+    return { ...base, npcs };
+  }
+
+  if (kind === 'events') {
+    const npcBytes = await readSibling('npclist');
+    const names = npcBytes ? npcNameMap(parseNpcList(npcBytes)) : null;
+    const actors = parseEventDat(bytes, names);
+    const dlgBytes = await readSibling('dialog');
+    let dialogTexts = null;
+    if (dlgBytes) {
+      try { dialogTexts = parseDialogDat(dlgBytes).entries.map((e) => e.text); }
+      catch { /* opcode rows just skip the snippet */ }
+    }
+    const stats = { events: 0, cutscenes: 0, categories: Object.fromEntries(EVENT_CATEGORIES.map((c) => [c, 0])) };
+    for (const a of actors) {
+      for (const e of a.events) {
+        stats.events++;
+        if (e.isCutscene) stats.cutscenes++;
+        stats.categories[e.category] = (stats.categories[e.category] ?? 0) + 1;
+      }
+    }
+    return { ...base, actors, dialogTexts, stats };
+  }
+
+  // dialog
+  const { entries, obfuscated } = parseDialogDat(bytes);
+  let conversations = null;
+  const evBytes = await readSibling('events');
+  if (evBytes) {
+    try {
+      const npcBytes = await readSibling('npclist');
+      const names = npcBytes ? npcNameMap(parseNpcList(npcBytes)) : null;
+      const actors = parseEventDat(evBytes, names);
+      const speakers = dialogSpeakers(actors);
+      for (const e of entries) e.speakers = [...(speakers.get(e.index) ?? [])];
+      conversations = dialogConversations(actors);
+    } catch { /* lines render unattributed, flat only */ }
+  }
+  return { ...base, entries, obfuscated, conversations };
 }
 
 export default function App() {
@@ -291,6 +439,7 @@ export default function App() {
   const effectTokenRef = useRef(0);                         // drop stale effect-load results
   const zoneMusicRef = useRef(null);                        // zone_music.json (server zone_settings)
   const zoneMusicIdRef = useRef(null);                      // zone id of the loaded zone
+  const zoneCamKeyRef = useRef('');                         // path key for per-zone camera save
   const [zoneTrack, setZoneTrackState] = useState(null);    // resolved BGM for this zone + time
   const zoneTrackRef = useRef(null);
   const setZoneTrack = useCallback((t) => { zoneTrackRef.current = t; setZoneTrackState(t); }, []);
@@ -478,8 +627,13 @@ export default function App() {
       const parsed = [];
       const skipped = [];
       const parse1 = async (path) => {
-        const buffer = await backend.readFile(path);
-        return { path, model: parseEntity(buffer, path) };
+        const settings = settingsRef.current;
+        const rel = relFromAbs(path, settings);
+        const { path: resolved, data: buffer } = await backend.readPrefer(
+          // Already-absolute paths outside either root (Open DAT…) read as-is.
+          rel !== path ? gameCandidates(rel, settings) : [path],
+        );
+        return { path: resolved, model: parseEntity(buffer, resolved) };
       };
       for (let i = 0; i < paths.length; i++) {
         if (!stillCurrent()) { releaseOverlay(); return; }
@@ -509,8 +663,8 @@ export default function App() {
         const type = weapon?.info?.weaponAnimationType;
         const rel = type != null ? battleTable[type] : null;
         if (rel) {
-          const abs = `${settingsRef.current.gamePath}\\${rel.replace(/\//g, '\\')}`;
-          if (!parsed.some((e) => e.path.toLowerCase() === abs.toLowerCase())) {
+          const abs = `${settingsRef.current.gamePath}\\${normRel(rel)}`;
+          if (!parsed.some((e) => relFromAbs(e.path, settingsRef.current).toLowerCase() === normRel(rel).toLowerCase())) {
             try { parsed.push(await parse1(abs)); } catch (err) { console.warn(`battle idle ${abs}:`, err); }
           }
         }
@@ -692,12 +846,7 @@ export default function App() {
     }
   }, [beginLoad, stepLoad, endLoad]);
 
-  const relativeName = (path) => {
-    const base = settingsRef.current?.gamePath ?? '';
-    return base && path.toLowerCase().startsWith(base.toLowerCase())
-      ? path.slice(base.length).replace(/^[\\/]+/, '')
-      : path;
-  };
+  const relativeName = (path) => relFromAbs(path, settingsRef.current);
 
   const loadFromTree = useCallback(
     (path) => loadModel([path], relativeName(path)),
@@ -723,10 +872,10 @@ export default function App() {
   const keyTablesRef = useRef(null);
   const getKeyTables = useCallback(async () => {
     if (keyTablesRef.current) return keyTablesRef.current;
-    const gamePath = settingsRef.current?.gamePath;
-    if (!gamePath) throw new Error('Game path not set');
-    const dllPath = `${gamePath}\\FFXiMain.dll`;
-    const buf = await backend.readFile(dllPath);
+    const settings = settingsRef.current;
+    if (!settings?.gamePath) throw new Error('Game path not set');
+    // DLL keys are install-specific — always the vanilla game path, not HD.
+    const buf = await backend.readFile(`${settings.gamePath}\\FFXiMain.dll`);
     keyTablesRef.current = extractKeyTables(buf);
     return keyTablesRef.current;
   }, []);
@@ -738,7 +887,7 @@ export default function App() {
    * meshes, sprites and curves — impact splashes, sparks, lens flares. It's
    * loaded once and cached, since zones swap far more often than it changes.
    */
-  const buildParticleSystem = useCallback(async (treeBuf, parsed, environment, gamePath) => {
+  const buildParticleSystem = useCallback(async (treeBuf, parsed, environment, settings) => {
     const warnings = [];
     const effectParser = {
       [SEC.EFFECT]: (b, d, s, e) => parseParticleGenerator(b, d, s, e, (m) => warnings.push(m)),
@@ -754,7 +903,7 @@ export default function App() {
 
     if (!globalEffectsRef.current) {
       try {
-        const buf = await backend.readFile(`${gamePath}\\ROM\\0\\0.DAT`);
+        const { data: buf } = await backend.readPrefer(gameCandidates('ROM\\0\\0.DAT', settings));
         globalEffectsRef.current = { root: treeOf(buf, globalParsers), textures: parseDatTextures(buf) };
       } catch (e) {
         console.warn('shared effects DAT (ROM/0/0.DAT) unavailable', e);
@@ -782,10 +931,10 @@ export default function App() {
   // ── Assets > Effects ───────────────────────────────────────────────────────
 
   /** Load ROM/0/0.DAT once — the shared effects tree spell DATs link into. */
-  const ensureGlobalEffects = useCallback(async (gamePath, warnings) => {
+  const ensureGlobalEffects = useCallback(async (settings, warnings) => {
     if (globalEffectsRef.current) return globalEffectsRef.current;
     try {
-      const buf = await backend.readFile(`${gamePath}\\ROM\\0\\0.DAT`);
+      const { data: buf } = await backend.readPrefer(gameCandidates('ROM\\0\\0.DAT', settings));
       globalEffectsRef.current = {
         root: buildParticleTree(buf, particleParsers(false, warnings), warnings),
         textures: parseDatTextures(buf),
@@ -807,10 +956,9 @@ export default function App() {
    * draws the particles at the world origin (no actor rig — see effect.js).
    */
   const loadEffect = useCallback(async (entry) => {
-    const gamePath = settingsRef.current?.gamePath;
-    if (!gamePath) { setStatusText('Set a game path in Settings first.'); return; }
-    const rel = entry.path.replace(/\//g, '\\');
-    const abs = `${gamePath}\\${rel}`;
+    const settings = settingsRef.current;
+    if (!settings?.gamePath) { setStatusText('Set a game path in Settings first.'); return; }
+    const rel = normRel(entry.path);
     const token = ++effectTokenRef.current;
     // Silence the outgoing effect on the click, not when the new one finishes
     // loading — reading and parsing the DAT takes long enough that the old
@@ -821,10 +969,10 @@ export default function App() {
     setStatusText(`Loading ${entry.name}…`);
 
     try {
-      const buf = await backend.readFile(abs);
+      const { data: buf } = await backend.readPrefer(gameCandidates(rel, settings));
       const parsed = parseEffectRoutines(buf);
       const warnings = [];
-      await ensureGlobalEffects(gamePath, warnings);
+      await ensureGlobalEffects(settings, warnings);
       if (token !== effectTokenRef.current) return;   // superseded by a newer click
 
       // Expand each routine's 0x03 calls now, so picking one from the Schedule
@@ -1031,7 +1179,8 @@ export default function App() {
     if (!p) return;
     if (!track) { p.stop(); return; }
 
-    const path = `${settingsRef.current?.gamePath}\\${track.root}\\win\\music\\data\\${track.file}`;
+    const rel = `${track.root}\\win\\music\\data\\${track.file}`;
+    const path = await backend.resolvePrefer(gameCandidates(rel, settingsRef.current));
     if (p.current?.path === path && p.playing) { p.pause(); return; }
     if (p.current?.path === path) { p.resume(); return; }
 
@@ -1063,9 +1212,9 @@ export default function App() {
         return ctx;
       },
       loadSound: async (relPath) => {
-        const gamePath = settingsRef.current?.gamePath;
-        if (!gamePath) return null;
-        const abs = `${gamePath}\\${relPath}`;
+        const settings = settingsRef.current;
+        if (!settings?.gamePath) return null;
+        const abs = await backend.resolvePrefer(gameCandidates(relPath, settings));
         const buffer = await backend.readFile(abs);
         const header = parseAudioHeader(buffer);
         const audioCtx = weatherAudioRef.current.getContext();
@@ -1084,16 +1233,42 @@ export default function App() {
     return weatherAudioRef.current;
   }, []);
 
-  /** Load a zone DAT into the viewport (Assets > Zones). */
-  const loadZone = useCallback(async (zone) => {
-    const gamePath = settingsRef.current?.gamePath;
-    if (!gamePath) {
+  /** Persist the live camera for the zone currently on screen (if any). */
+  const persistCurrentZoneCamera = useCallback(() => {
+    const key = zoneCamKeyRef.current;
+    const cam = rendererRef.current?.camera;
+    if (!key || !cam || modelRef.current?.kind !== 'zone') return;
+    writeZoneCamera(key, cam.snapshot());
+  }, []);
+
+  // Keep the last zone pose across app quit / tab close.
+  useEffect(() => {
+    const onHide = () => persistCurrentZoneCamera();
+    window.addEventListener('pagehide', onHide);
+    window.addEventListener('beforeunload', onHide);
+    return () => {
+      window.removeEventListener('pagehide', onHide);
+      window.removeEventListener('beforeunload', onHide);
+    };
+  }, [persistCurrentZoneCamera]);
+
+  /**
+   * Load a zone DAT into the viewport (Assets > Zones).
+   * opts.keepCamera / opts.cameraSnap — skip the default fit (HD reload).
+   * Otherwise restores the last saved camera for this zone, if any.
+   */
+  const loadZone = useCallback(async (zone, opts = {}) => {
+    const { keepCamera = false, cameraSnap = null } = opts;
+    const settings = settingsRef.current;
+    if (!settings?.gamePath) {
       setStatusText('Game path not set — open Settings first.');
       return;
     }
+    // Leaving another zone — remember where the camera was.
+    persistCurrentZoneCamera();
     const rel = zoneDatRelPath(zone.path);
-    const abs = `${gamePath}\\${rel}`;
     const displayName = zone.name || rel;
+    const key = zoneCamKey(zone);
     const gen = ++loadGenRef.current;
     const stillCurrent = () => gen === loadGenRef.current;
     const releaseOverlay = () => {
@@ -1103,8 +1278,8 @@ export default function App() {
       beginLoad(displayName, 'Reading DAT…');
       overlayGenRef.current = gen;
       player.stop();
-      const [datBuf, keyTables] = await Promise.all([
-        backend.readFile(abs),
+      const [{ data: datBuf, path: resolvedAbs }, keyTables] = await Promise.all([
+        backend.readPrefer(gameCandidates(rel, settings)),
         getKeyTables(),
       ]);
       if (!stillCurrent()) { releaseOverlay(); return; }
@@ -1142,7 +1317,7 @@ export default function App() {
       stepLoad('Loading effects…');
       let particleSystem = null;
       try {
-        particleSystem = await buildParticleSystem(treeBuf, parsed, environment, gamePath);
+        particleSystem = await buildParticleSystem(treeBuf, parsed, environment, settings);
         if (environment) environment.particleSystem = particleSystem;
         // The weather set is activated after the renderer attaches its camera —
         // sun/moon generators read the camera as they're constructed.
@@ -1173,7 +1348,24 @@ export default function App() {
       renderer.setTerrainLighting(terrainLit || terrainLightingFromEnv(null, time0));
       renderer.setSkyDome(skyDome);
       renderer.skyWeather = weather0;
-      renderer.setModel(model);
+
+      // Camera: HD reload keeps the live pose; re-open restores the last pose
+      // for this zone; first visit fits + optional auto-WASD.
+      const saved = keepCamera ? (cameraSnap || null) : readZoneCamera(key);
+      renderer.setModel(model, !!saved);
+      if (saved) {
+        const mode = saved.mode === 'orbit' ? 'orbit' : 'fly';
+        // Sync WASD UI without setMode — restore() assigns mode itself.
+        wasdRef.current = mode === 'fly';
+        setWasdState(mode === 'fly');
+        try { localStorage.setItem('wasd', mode === 'fly' ? '1' : '0'); } catch { /* quota */ }
+        renderer.camera.restore({ ...saved, mode });
+      } else if (settingsRef.current?.autoWasdZones !== false) {
+        // setModel already fitted in orbit; seat fly on that eye.
+        setWasd(true);
+        renderer.fitCamera();
+      }
+
       // setModel clears any previous system, so attach after it. Attaching also
       // installs the camera adapter, which the weather generators need.
       renderer.setParticleSystem(particleSystem, environment);
@@ -1191,10 +1383,11 @@ export default function App() {
       zoneMusicIdRef.current = zone.id ?? null;
       const hour = Math.floor((environment?.getTimeMinutes() ?? time0) / 60);
       resolveZoneTrack(zone.id, hour < 6 || hour >= 18);
-      setSelectedDat(abs.toLowerCase());
+      setSelectedDat(resolvedAbs.toLowerCase());
       setModelPath(rel);
-      shownPathRef.current = abs;
-      sourcePathRef.current = abs;
+      shownPathRef.current = resolvedAbs;
+      sourcePathRef.current = resolvedAbs;
+      zoneCamKeyRef.current = key;
       animsRef.current = [];
       setAnims([]);
       setSchedules([]);
@@ -1203,10 +1396,6 @@ export default function App() {
       setPlayingState(false);
       renderer.setAnimation(null);
       renderer.playing = false;
-      // Auto-WASD for zones (setting default on) — set mode before fit so the
-      // fly camera seats on the fitted orbit eye.
-      if (settingsRef.current?.autoWasdZones !== false) setWasd(true);
-      renderer.fitCamera();
 
       const zs = model.zoneStats ?? {};
       // Skybox = gradient dome and/or cloud shells. Indoor star/sun discs alone
@@ -1279,7 +1468,7 @@ export default function App() {
       releaseOverlay();
       if (stillCurrent()) setStatusText(`${displayName} — failed: ${err.message ?? err}`);
     }
-  }, [getKeyTables, beginLoad, stepLoad, endLoad, setWasd, buildParticleSystem, getWeatherAudio, resolveZoneTrack]);
+  }, [getKeyTables, beginLoad, stepLoad, endLoad, setWasd, buildParticleSystem, getWeatherAudio, resolveZoneTrack, persistCurrentZoneCamera]);
 
   // Character composer (Assets > Characters) — shared by the left panel and
   // the Animation panel Action combo.
@@ -1342,7 +1531,11 @@ export default function App() {
           if (last?.kind === 'zone' && last.zone?.path) {
             lastZone = last.zone;
           } else if (last?.paths?.length) {
-            await backend.readFile(last.paths[0]);   // probe — throws if missing
+            // Probe with HD fallback so a pack-only DAT still restores.
+            const probeRel = relFromAbs(last.paths[0], initialSettings);
+            await backend.readPrefer(
+              probeRel !== last.paths[0] ? gameCandidates(probeRel, initialSettings) : [last.paths[0]],
+            );
             paths = last.paths;
             name = last.name || relativeName(last.paths[last.paths.length - 1]);
             lastOpts = last.opts ?? null;
@@ -1509,16 +1702,16 @@ export default function App() {
 
   // --- scene / floor -------------------------------------------------------
 
-  const resolveSpecPath = (spec) => {
+  const resolveSpecRel = (spec) => {
     const parts = spec.split('/');
     const [rom, dir, file] = parts.length === 2 ? ['1', parts[0], parts[1]] : parts;
     const romDir = rom === '1' ? 'ROM' : `ROM${rom}`;
-    return `${settingsRef.current.gamePath}\\${romDir}\\${dir}\\${file}.DAT`;
+    return `${romDir}\\${dir}\\${file}.DAT`;
   };
 
   const loadFloor = useCallback(async (spec, fourcc) => {
     try {
-      const buffer = await backend.readFile(resolveSpecPath(spec));
+      const { data: buffer } = await backend.readPrefer(gameCandidates(resolveSpecRel(spec), settingsRef.current));
       const tex = parseFloorTexture(buffer, fourcc);
       if (!tex) { setStatusText(`Floor '${fourcc}' not found in ${spec}`); return; }
       rendererRef.current.setFloorTexture(tex);
@@ -1573,11 +1766,21 @@ export default function App() {
   const dataTokenRef = useRef(0);                       // drop stale reads
   const dataBufRef = useRef(null);                      // raw buffer, for texture decode on click
   const dataTexturesRef = useRef(null);                 // lazy parseDatTextures cache
+  const dataTablesRef = useRef(null);                   // merged FTABLE maps (zone DAT cross-refs)
 
   const loadDatData = useCallback(async (path) => {
     const token = ++dataTokenRef.current;
+    const settings = settingsRef.current;
     const rel = relativeName(path);
     setStatusText(`Reading ${rel}…`);
+    const readAbs = async (abs) => {
+      const r = relFromAbs(abs, settings);
+      if (r !== abs) {
+        const { data } = await backend.readPrefer(gameCandidates(r, settings));
+        return data;
+      }
+      return backend.readFile(abs);
+    };
     try {
       // FTABLE/VTABLE pairs get the id → DAT listing, not a section walk.
       const table = matchTablePath(path);
@@ -1585,7 +1788,7 @@ export default function App() {
       if (table) {
         const dir = path.slice(0, path.length - path.split(/[\\/]/).pop().length);
         const siblingPath = `${dir}${table.siblingName}`;
-        const [own, sibling] = await Promise.all([backend.readFile(path), backend.readFile(siblingPath)]);
+        const [own, sibling] = await Promise.all([readAbs(path), readAbs(siblingPath)]);
         if (token !== dataTokenRef.current) return;
         const [ftBuf, vtBuf] = table.kind === 'ftable' ? [own, sibling] : [sibling, own];
         doc = {
@@ -1598,21 +1801,37 @@ export default function App() {
         };
         dataBufRef.current = null;
       } else {
-        const buf = await backend.readFile(path);
+        const buf = await readAbs(path);
         if (token !== dataTokenRef.current) return;
         doc = inspectDat(buf);
         dataBufRef.current = buf;
+        // Non-sectioned DATs may still be a known zone script format.
+        if (doc.kind === 'other') {
+          const bytes = new Uint8Array(buf);
+          const zkind = sniffZoneDat(bytes);
+          if (zkind) {
+            doc = await buildZoneDatDoc(zkind, bytes, rel, settingsRef.current, dataTablesRef);
+            if (token !== dataTokenRef.current) return;
+          }
+        }
       }
       dataTexturesRef.current = null;
       setDataDoc({ ...doc, path: rel });
       setSelectedDat(path.toLowerCase());
       setModelPath(rel);
       shownPathRef.current = path;
+      const zoneSuffix = doc.zoneName ? ` · ${doc.zoneName}` : '';
       setStatusText(doc.kind === 'sections'
         ? `${doc.sectionCount.toLocaleString()} sections · ${doc.dirCount.toLocaleString()} folder${doc.dirCount === 1 ? '' : 's'}`
         : doc.kind === 'ftable'
           ? `${doc.registered.toLocaleString()} of ${doc.capacity.toLocaleString()} file ids registered`
-          : doc.label);
+          : doc.kind === 'npclist'
+            ? `${doc.npcs.length.toLocaleString()} NPCs${zoneSuffix}`
+            : doc.kind === 'events'
+              ? `${doc.actors.length.toLocaleString()} actors · ${doc.stats.events.toLocaleString()} events${zoneSuffix}`
+              : doc.kind === 'dialog'
+                ? `${doc.entries.length.toLocaleString()} dialog entries${zoneSuffix}`
+                : doc.label);
     } catch (e) {
       if (token !== dataTokenRef.current) return;
       setDataDoc(null);
@@ -1641,8 +1860,10 @@ export default function App() {
 
   /** Drop the scene and everything that described it. */
   const unloadModel = useCallback(() => {
+    persistCurrentZoneCamera();
     rendererRef.current?.setModel(null);
     modelRef.current = null;
+    zoneCamKeyRef.current = '';
     // Zone ambience is driven by the particle system, which setModel just threw
     // away — detach so the weather bed stops instead of holding its last voice.
     weatherAudioRef.current?.attach(null, null);
@@ -1659,7 +1880,7 @@ export default function App() {
     setPlayingState(false);
     setObjectGroups(null);
     setStatusText('');
-  }, []);
+  }, [persistCurrentZoneCamera]);
 
   // One view on screen at a time, each arriving clean. Without this a model
   // keeps rendering (and animating) behind the Images page, music plays on under
@@ -1688,8 +1909,8 @@ export default function App() {
   }, [leftView, unloadModel, player]);
 
   const loadImage = useCallback(async (entry) => {
-    const gamePath = settingsRef.current?.gamePath;
-    if (!gamePath) { setStatusText('Game path not set — open Settings first.'); return; }
+    const settings = settingsRef.current;
+    if (!settings?.gamePath) { setStatusText('Game path not set — open Settings first.'); return; }
     setImageEntry(entry);
     // Remember it so reopening on the Images page restores this image rather
     // than falling through to the default model. Store just {name, path}.
@@ -1704,7 +1925,7 @@ export default function App() {
     setAnims([]);
     setCurrentAnim('');
     try {
-      const buf = await backend.readFile(`${gamePath}\\${entry.path}`);
+      const { data: buf } = await backend.readPrefer(gameCandidates(entry.path, settings));
       const doc = parseImageDat(buf);
       if (doc.kind === 'sets') {
         // Resolve each set's atlas once here so the panel and the viewer agree.
@@ -1752,8 +1973,10 @@ export default function App() {
 
   const saveSettings = async (draft) => {
     const gamePath = draft.gamePath.trim();
+    const hdPath = (draft.hdPath || '').trim();
     const cexiPath = (draft.cexiPath || '').trim();
     const prevPath = settingsRef.current?.gamePath ?? '';
+    const prevHd = settingsRef.current?.hdPath ?? '';
 
     if (!gamePath) {
       setSettingsError('Game path is required. Browse to your FINAL FANTASY XI install folder.');
@@ -1765,15 +1988,29 @@ export default function App() {
       setSettingsError(`Game path not found:\n${gamePath}`);
       return;
     }
+    if (hdPath) {
+      try {
+        await backend.listDir(hdPath);
+      } catch {
+        setSettingsError(`HD path not found:\n${hdPath}`);
+        return;
+      }
+    }
 
     localStorage.setItem('gamePath', gamePath);
+    localStorage.setItem('hdPath', hdPath);
     localStorage.setItem('bgColor', draft.bgColor);
     localStorage.setItem('autoPlay', draft.autoPlay ? '1' : '0');
     localStorage.setItem('autoWasdZones', draft.autoWasdZones === false ? '0' : '1');
     localStorage.setItem('cexiPath', cexiPath);
+    // Clearing the HD path forces the toggle off.
+    const hdEnabled = hdPath ? !!draft.hdEnabled : false;
+    if (!hdPath) localStorage.setItem('hdEnabled', '0');
     const next = {
       ...draft,
       gamePath,
+      hdPath,
+      hdEnabled,
       cexiPath,
       autoWasdZones: draft.autoWasdZones !== false,
     };
@@ -1785,9 +2022,15 @@ export default function App() {
     // Path changed (or first successful set) — load the default model.
     if (gamePath.toLowerCase() !== prevPath.toLowerCase() || !modelRef.current) {
       keyTablesRef.current = null;   // FFXiMain.dll keys are install-specific
+      globalEffectsRef.current = null;
       const dat = `${gamePath}\\${DEFAULT_DAT_SUFFIX}`;
       await loadModel([dat], DEFAULT_DAT_SUFFIX);
       setRevealTarget(dat.toLowerCase());
+    } else if (hdPath.toLowerCase() !== prevHd.toLowerCase()) {
+      // HD root changed while a model is up — drop cached shared tables/effects
+      // so the next load picks up the new pack.
+      globalEffectsRef.current = null;
+      dataTablesRef.current = null;
     }
   };
 
@@ -1853,6 +2096,37 @@ export default function App() {
       case 'toggle-textures':
         setShowTex((v) => !v);
         break;
+      case 'toggle-hd': {
+        const s = settingsRef.current;
+        if (!s?.hdPath) break;
+        const loaded = modelRef.current;
+        const camSnap = rendererRef.current?.camera?.snapshot?.() ?? null;
+        if (loaded?.kind === 'zone') persistCurrentZoneCamera();
+        const next = { ...s, hdEnabled: !s.hdEnabled };
+        try { localStorage.setItem('hdEnabled', next.hdEnabled ? '1' : '0'); } catch { /* quota */ }
+        setSettings(next);
+        settingsRef.current = next;
+        // Shared ROM/0/0.DAT and FTABLE may differ between packs.
+        globalEffectsRef.current = null;
+        dataTablesRef.current = null;
+        setStatusText(next.hdEnabled ? `HD on — ${s.hdPath}` : 'HD off — using game path');
+        // Reload the on-screen zone/model so meshes/textures swap immediately.
+        if (!loaded) break;
+        try {
+          const last = JSON.parse(localStorage.getItem(LAST_DAT_KEY) || 'null');
+          if (loaded.kind === 'zone' && last?.kind === 'zone' && last.zone?.path) {
+            loadZone(last.zone, { keepCamera: true, cameraSnap: camSnap });
+          } else if (last?.paths?.length) {
+            loadModel(last.paths, last.name || relativeName(last.paths[last.paths.length - 1]), {
+              ...(last.opts ?? {}),
+              keepCamera: true,
+            });
+          }
+        } catch (e) {
+          console.warn('HD reload failed', e);
+        }
+        break;
+      }
       case 'toggle-wireframe':
         setShowWireframe((v) => !v);
         break;
@@ -2060,6 +2334,7 @@ export default function App() {
         onAction={handleMenuAction}
         checks={{
           textures: showTex,
+          hd: !!settings?.hdEnabled,
           wireframe: showWireframe,
           skeleton: showSkeleton,
           alpha: showAlpha,
@@ -2075,6 +2350,7 @@ export default function App() {
           noCollision: !hasCollision,
           noNavmesh: !hasNavmesh,
           noSkybox: !hasSkybox,
+          noHdPath: !settings?.hdPath,
         }}
         flySpeed={flySpeed}
         fov={fov}
@@ -2101,6 +2377,8 @@ export default function App() {
       {explorerOpen && leftView === 'music' && (
         <MusicList
           gamePath={settings?.gamePath ?? ''}
+          hdPath={settings?.hdPath ?? ''}
+          hdEnabled={!!settings?.hdEnabled}
           player={player}
           onError={(msg) => setStatusText(msg)}
         />
@@ -2108,6 +2386,8 @@ export default function App() {
       {explorerOpen && leftView === 'sfx' && (
         <SfxList
           gamePath={settings?.gamePath ?? ''}
+          hdPath={settings?.hdPath ?? ''}
+          hdEnabled={!!settings?.hdEnabled}
           player={player}
           onError={(msg) => setStatusText(msg)}
         />
@@ -2340,7 +2620,7 @@ export default function App() {
 
       <SettingsModal
         open={settingsOpen}
-        initial={settings ?? { gamePath: '', bgColor: DEFAULT_BG, autoPlay: true, autoWasdZones: true, cexiPath: '' }}
+        initial={settings ?? { gamePath: '', hdPath: '', hdEnabled: false, bgColor: DEFAULT_BG, autoPlay: true, autoWasdZones: true, cexiPath: '' }}
         error={settingsError}
         onSave={saveSettings}
         onClose={() => { setSettingsOpen(false); setSettingsError(''); }}

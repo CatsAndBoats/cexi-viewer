@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { backend } from '../js/backend.js';
+import { gameCandidates } from '../js/gamePath.js';
 import { parseAudioHeader, toAudioBuffer, FMT_ATRAC3 } from '../js/audio.js';
 
 // FFXI ships music across seven sound roots; each aligns with an expansion.
@@ -24,7 +25,7 @@ async function loadNames() {
   return new Map();
 }
 
-export function MusicList({ gamePath, onError, player }) {
+export function MusicList({ gamePath, hdPath = '', hdEnabled = false, onError, player }) {
   const [names, setNames] = useState(null);
   const [roots, setRoots] = useState(null);
 
@@ -69,14 +70,20 @@ export function MusicList({ gamePath, onError, player }) {
         {roots === null && <div className="side-note">Scanning music…</div>}
         {roots?.length === 0 && <div className="side-note">No music found under the game folder.</div>}
         {roots?.map((group) => (
-          <MusicGroup key={group.root} group={group} player={player} onError={onError} />
+          <MusicGroup
+            key={group.root}
+            group={group}
+            player={player}
+            onError={onError}
+            settings={{ gamePath, hdPath, hdEnabled }}
+          />
         ))}
       </div>
     </div>
   );
 }
 
-function MusicGroup({ group, player, onError }) {
+function MusicGroup({ group, player, onError, settings }) {
   const [open, setOpen] = useState(group.root === 'sound');
   return (
     <div className={`node${open ? ' open' : ''}`}>
@@ -89,7 +96,7 @@ function MusicGroup({ group, player, onError }) {
       {open && (
         <div className="children">
           {group.tracks.map((t) => (
-            <TrackRow key={t.file} track={t} player={player} onError={onError} />
+            <TrackRow key={t.file} track={t} player={player} onError={onError} settings={settings} />
           ))}
         </div>
       )}
@@ -97,11 +104,18 @@ function MusicGroup({ group, player, onError }) {
   );
 }
 
-function TrackRow({ track, player, onError }) {
-  const active = player.current?.path === track.path;
+function TrackRow({ track, player, onError, settings }) {
+  const active = player.current?.file === track.file && player.current?.root === track.root;
+  const play = async () => {
+    const path = await backend.resolvePrefer(gameCandidates(
+      `${track.root}\\win\\music\\data\\${track.file}`,
+      settings,
+    ));
+    await player.play({ ...track, path });
+  };
   return (
     <div className={`node${active ? ' selected' : ''}`}>
-      <div className="row" onClick={() => player.play(track).catch((e) => onError?.(String(e.message ?? e)))}>
+      <div className="row" onClick={() => play().catch((e) => onError?.(String(e.message ?? e)))}>
         <span className="caret">
           {active && player.playing
             ? <span className="eq"><i /><i /><i /><i /></span>
@@ -220,7 +234,11 @@ export function useAudioPlayer() {
     const ctx = ensureCtx();
     await ctx.resume();
 
-    if (current?.path === track.path && bufferRef.current) {
+    const same = current && (
+      current.path === track.path
+      || (current.file === track.file && current.root === track.root)
+    );
+    if (same && bufferRef.current) {
       playingRef.current ? pause() : startFrom(offsetRef.current >= (bufferRef.current.duration - 0.05) ? 0 : offsetRef.current);
       return;
     }

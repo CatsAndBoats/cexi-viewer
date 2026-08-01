@@ -25,6 +25,42 @@ export const backend = {
     return res.arrayBuffer();
   },
 
+  /** True if a file (not directory) exists at path. */
+  async fileExists(path) {
+    if (isTauri()) return tauriInvoke('file_exists', { path });
+    const res = await fetch(`/fs/exists?path=${encodeURIComponent(path)}`);
+    if (!res.ok) return false;
+    return (await res.text()) === '1';
+  },
+
+  /**
+   * First existing path among candidates, or the last non-empty candidate
+   * (so a subsequent read still surfaces a useful missing-file error).
+   */
+  async resolvePrefer(candidates) {
+    let fallback = '';
+    for (const p of candidates) {
+      if (!p) continue;
+      fallback = p;
+      if (await this.fileExists(p)) return p;
+    }
+    return fallback;
+  },
+
+  /** Try each candidate path until a read succeeds. */
+  async readPrefer(candidates) {
+    let lastErr;
+    for (const p of candidates) {
+      if (!p) continue;
+      try {
+        return { path: p, data: await this.readFile(p) };
+      } catch (e) {
+        lastErr = e;
+      }
+    }
+    throw lastErr ?? new Error('file not found');
+  },
+
   async defaultGamePath() {
     if (isTauri()) return tauriInvoke('default_game_path');
     const res = await fetch('/fs/default');

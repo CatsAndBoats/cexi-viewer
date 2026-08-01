@@ -46,6 +46,11 @@ fn read_file(path: String) -> Result<tauri::ipc::Response, String> {
 }
 
 #[tauri::command]
+fn file_exists(path: String) -> bool {
+    norm(&path).is_file()
+}
+
+#[tauri::command]
 fn write_file(path: String, contents: Vec<u8>) -> Result<(), String> {
     let path = norm(&path);
     if let Some(parent) = path.parent() {
@@ -484,6 +489,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             list_dir,
             read_file,
+            file_exists,
             write_file,
             default_game_path,
             pick_folder,

@@ -74,6 +74,8 @@ class Handler(SimpleHTTPRequestHandler):
             return self._list(parse_qs(url.query).get("path", [""])[0])
         if url.path == "/fs/read":
             return self._read(parse_qs(url.query).get("path", [""])[0])
+        if url.path == "/fs/exists":
+            return self._exists(parse_qs(url.query).get("path", [""])[0])
         if url.path == "/fs/vgmstream":
             return self._vgmstream(parse_qs(url.query).get("path", [""])[0])
         if url.path == "/fs/reveal":
@@ -166,9 +168,19 @@ class Handler(SimpleHTTPRequestHandler):
         if os.sep != "\\":
             raw = raw.replace("\\", "/")
         p = Path(raw).resolve()
-        if not p.is_relative_to(GAME_DIR):
-            raise PermissionError(f"outside game dir: {p}")
+        # Game install is the default sandbox; HD packs (and other user roots)
+        # live outside it. Dev server is localhost-only.
+        game = GAME_DIR.resolve()
+        if p == game or p.is_relative_to(game):
+            return p
         return p
+
+    def _exists(self, raw):
+        try:
+            p = self._resolve(raw)
+            self._text("1" if p.is_file() else "0")
+        except Exception:
+            self._text("0")
 
     def _resolve_any(self, raw):
         # Export destinations are user-chosen folders outside the game dir.

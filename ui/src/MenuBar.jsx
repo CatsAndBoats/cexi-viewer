@@ -21,6 +21,7 @@ const MENUS = [
       { id: 'toggle-wireframe', label: 'Toggle Wireframe', icon: 'grid_on', check: 'wireframe' },
       { id: 'toggle-skeleton', label: 'Toggle Skeleton', icon: 'accessibility_new', check: 'skeleton' },
       { id: 'toggle-textures', label: 'Toggle Textures', icon: 'texture', check: 'textures' },
+      { id: 'toggle-hd', label: 'Toggle HD', icon: 'hd', check: 'hd', disableWhen: 'noHdPath' },
       { id: 'toggle-alpha', label: 'Toggle Alpha', icon: 'opacity', check: 'alpha' },
       { id: 'toggle-unlit', label: 'Toggle Unlit', icon: 'light_mode', check: 'unlit' },
       { id: 'toggle-collision', label: 'Toggle Collision', icon: 'select_all', check: 'collision', disableWhen: 'noCollision' },

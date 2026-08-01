@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { backend } from '../js/backend.js';
+import { gameCandidates, relFromAbs } from '../js/gamePath.js';
 
 // Sound effects live at <root>/win/se/seNNN/seNNNNNN.spw. The seNNN folder
 // (id / 1000) is the natural category grouping.
@@ -32,9 +33,10 @@ async function loadSfxMeta() {
   return { folders: new Map(), names: new Map() };
 }
 
-export function SfxList({ gamePath, player, onError }) {
+export function SfxList({ gamePath, hdPath = '', hdEnabled = false, player, onError }) {
   const [roots, setRoots] = useState(null);
   const [meta, setMeta] = useState({ folders: new Map(), names: new Map() });
+  const settings = { gamePath, hdPath, hdEnabled };
 
   useEffect(() => {
     if (!gamePath) return;
@@ -59,14 +61,14 @@ export function SfxList({ gamePath, player, onError }) {
         {roots === null && <div className="side-note">Scanning sound effects…</div>}
         {roots?.length === 0 && <div className="side-note">No sound effects found.</div>}
         {roots?.map((r) => (
-          <SfxRoot key={r.root} group={r} meta={meta} player={player} onError={onError} />
+          <SfxRoot key={r.root} group={r} meta={meta} player={player} onError={onError} settings={settings} />
         ))}
       </div>
     </div>
   );
 }
 
-function SfxRoot({ group, meta, player, onError }) {
+function SfxRoot({ group, meta, player, onError, settings }) {
   const [open, setOpen] = useState(false);
   const [folders, setFolders] = useState(null);
 
@@ -92,7 +94,7 @@ function SfxRoot({ group, meta, player, onError }) {
         <div className="children">
           {folders.map((name) => (
             <SfxFolder key={name} dir={`${group.dir}\\${name}`} name={name}
-              root={group.root} meta={meta} player={player} onError={onError} />
+              root={group.root} meta={meta} player={player} onError={onError} settings={settings} />
           ))}
         </div>
       )}
@@ -100,7 +102,7 @@ function SfxRoot({ group, meta, player, onError }) {
   );
 }
 
-function SfxFolder({ dir, name, root, meta, player, onError }) {
+function SfxFolder({ dir, name, root, meta, player, onError, settings }) {
   const [open, setOpen] = useState(false);
   const [files, setFiles] = useState(null);
 
@@ -133,10 +135,17 @@ function SfxFolder({ dir, name, root, meta, player, onError }) {
             const num = (f.match(/(\d+)/)?.[1] ?? '0');
             const title = meta.names.get(num.padStart(6, '0')) ?? null;
             const track = { file: f, path: `${dir}\\${f}`, root, num, name: title ?? stem };
-            const active = player.current?.path === track.path;
+            const active = player.current?.file === track.file && player.current?.root === track.root;
+            const play = async () => {
+              const rel = relFromAbs(track.path, settings);
+              const path = await backend.resolvePrefer(
+                rel !== track.path ? gameCandidates(rel, settings) : [track.path],
+              );
+              await player.play({ ...track, path });
+            };
             return (
               <div key={f} className={`node${active ? ' selected' : ''}`}>
-                <div className="row" onClick={() => player.play(track).catch((e) => onError?.(String(e.message ?? e)))}>
+                <div className="row" onClick={() => play().catch((e) => onError?.(String(e.message ?? e)))}>
                   <span className="caret">
                     {active && player.playing
                       ? <span className="eq"><i /><i /><i /><i /></span>
