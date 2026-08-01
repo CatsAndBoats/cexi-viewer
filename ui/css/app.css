@@ -1426,3 +1426,124 @@ input[type='color'] {
 .export-frame { display: flex; align-items: center; gap: 10px; }
 .export-frame .vol-slider { flex: 1 1 auto; }
 .export-frame-num { color: var(--muted); font-size: 11px; flex: 0 0 auto; }
+
+/* --- Data view (Assets > Data — DAT structure inspector) ------------------- */
+
+.data-viewer {
+  position: fixed;
+  left: 372px; right: 12px;
+  top: 60px; bottom: 52px;
+  display: flex; gap: 10px;
+  z-index: 20;
+}
+/* .panel is fixed-position by default; these live in the viewer's flex row. */
+.data-viewer .panel { position: relative; inset: auto; }
+
+.data-main {
+  flex: 1 1 auto; min-width: 0;
+  display: flex; flex-direction: column;
+  overflow: hidden;
+}
+.data-side {
+  flex: 0 0 320px;
+  display: flex; flex-direction: column; gap: 10px;
+  min-height: 0;
+}
+.data-card { display: flex; flex-direction: column; padding-bottom: 8px; overflow: hidden; }
+.data-card .details-row { padding: 0 12px; }
+.data-census { flex: 1 1 auto; min-height: 0; }
+
+.data-card-title {
+  display: flex; align-items: center; gap: 6px;
+  flex: 0 0 auto;
+  padding: 9px 12px 7px;
+  color: var(--gray-500);
+  font: 600 11px/1.4 var(--font-ui);
+  text-transform: uppercase; letter-spacing: 0.04em;
+}
+.data-card-title .icon { font-size: 16px; color: var(--accent); }
+.data-card-note {
+  margin-left: auto;
+  color: var(--gray-500);
+  font-weight: 400; text-transform: none; letter-spacing: 0;
+}
+
+.data-tree { flex: 1 1 auto; min-height: 0; overflow: auto; padding: 2px 0 10px; }
+.data-census-rows { flex: 1 1 auto; min-height: 0; overflow: auto; }
+
+.data-row {
+  display: flex; align-items: center; gap: 6px;
+  padding: 2px 12px 2px 8px;
+  white-space: nowrap;
+  font-size: 12px;
+}
+.data-dir-row { cursor: pointer; }
+.data-dir-row:hover { background: rgba(255, 255, 255, 0.06); }
+.data-caret {
+  font-size: 15px; width: 15px; flex: 0 0 15px;
+  color: var(--gray-500);
+  transition: transform 0.1s ease;
+}
+.data-caret.open { transform: rotate(90deg); }
+.data-caret-pad { width: 15px; flex: 0 0 15px; }
+.data-kind { font-size: 15px; color: var(--gray-400); flex: 0 0 auto; }
+.data-dir-row .data-kind { color: var(--accent); opacity: 0.8; }
+.data-id { color: var(--gray-100); flex: 0 0 auto; min-width: 42px; }
+.data-dir-counts { color: var(--gray-500); font-size: 11px; }
+.data-type { color: var(--gray-300); flex: 0 0 auto; }
+.data-detail {
+  flex: 1 1 auto; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis;
+  color: var(--muted); font-size: 11px;
+}
+.data-flags { color: var(--accent); font-size: 10px; flex: 0 0 auto; }
+.data-size { margin-left: auto; flex: 0 0 auto; color: var(--gray-500); font-size: 11px; }
+
+.data-res-click { cursor: pointer; }
+.data-res-click:hover { background: rgba(255, 255, 255, 0.06); }
+.data-res-click:hover .data-id { color: var(--accent); }
+.data-res-click:hover .data-kind { color: var(--accent); }
+
+.data-census-row {
+  display: flex; align-items: center; gap: 8px;
+  padding: 2px 12px;
+  font-size: 12px;
+}
+.data-census-row .icon { font-size: 15px; color: var(--gray-400); flex: 0 0 auto; }
+.data-census-name { flex: 1 1 auto; color: var(--gray-200); overflow: hidden; text-overflow: ellipsis; }
+.data-census-count { flex: 0 0 auto; min-width: 44px; text-align: right; color: var(--gray-100); }
+.data-census-bytes { flex: 0 0 auto; min-width: 70px; text-align: right; color: var(--gray-500); font-size: 11px; }
+
+.data-warning {
+  display: flex; align-items: flex-start; gap: 6px;
+  padding: 5px 12px 0;
+  color: #e2b04a; font-size: 11px; line-height: 1.4;
+}
+.data-warning .icon { font-size: 14px; margin-top: 1px; }
+
+.data-empty {
+  flex: 1 1 auto;
+  display: flex; flex-direction: column;
+  align-items: center; justify-content: center; gap: 6px;
+  text-align: center;
+  color: var(--muted);
+  padding: 30px;
+}
+.data-empty .icon { font-size: 42px; color: var(--gray-600); }
+.data-empty-title { font-size: 15px; font-weight: 600; color: var(--gray-200); }
+.data-empty-sub { font-size: 12px; max-width: 400px; line-height: 1.5; }
+
+/* Data view — FTABLE/VTABLE listing */
+.data-ft-row { cursor: pointer; }
+.data-ft-row:hover { background: rgba(255, 255, 255, 0.06); }
+.data-ft-row:hover .data-id { color: var(--accent); }
+.data-ft-id {
+  flex: 0 0 64px;
+  text-align: right;
+  color: var(--gray-400);
+}
+.data-ft-more {
+  padding: 8px 14px;
+  color: var(--gray-500);
+  font-size: 11px;
+}

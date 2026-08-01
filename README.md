@@ -1,8 +1,8 @@
 # CEXI Model Viewer
 
-A FFXI asset browser — **zones, NPCs & monsters, playable characters, textures,
-music and sound effects** — with a **WebGL2** viewport, wrapped in a **Tauri 2**
-shell (~7 MB standalone exe, no Electron). Skinning runs on the GPU: the vertex
+A FFXI asset browser — **zones, NPCs & monsters, playable characters, spell
+effects, textures, music, sound effects and raw DAT data** — with a **WebGL2**
+viewport, wrapped in a **Tauri 2** shell (~7 MB standalone exe, no Electron). Skinning runs on the GPU: the vertex
 shader rotates pre-weighted joint-local positions by per-joint pose quaternions;
 the CPU only evaluates the skeleton pose (one quat/trans/scale triplet per joint
 per frame).
@@ -23,10 +23,18 @@ Get the latest release by going to: [Github Releases](https://github.com/CatsAnd
   grouped by set (Artifact / Relic / Empyrean / Ebur / Furia / Ebon) and sorted
   A–Z; equipped weapons play their weapon-skill animations; the 40-character
   look string is generated and copyable.
+- **Effects** — search and play any standalone spell/ability VFX (magic, job
+  abilities, summons, weapon skills) on an empty stage, with schedule picker,
+  playback speed and the effect's own sound.
 - **Images** — browse every UI, map and cutscene texture DAT with a filter,
   per-set list and zoom.
 - **Music & Sound FX** — play any BGW/SPW track (vgmstream-decoded) with a live
   waveform visualiser, seek bar and loop info.
+- **Data** — a DAT inspector: walks any DAT's section tree (folders, resource
+  types, header peeks like texture size/format, joint counts, sound ids) without
+  dumping payloads; textures open in a viewer on click. FTABLE/VTABLE pairs
+  render as a searchable file-id → DAT table whose rows jump straight to the
+  named DAT's structure.
 - **Throughout** — type-to-filter dropdowns, arrow-key list navigation,
   reveal-any-DAT in the system file manager, wireframe / unlit / collision /
   navmesh / skybox overlays, and glTF/FBX model export (via the cexi-tools CLI).
@@ -56,6 +64,21 @@ Browse textures, and play music / sound effects with a waveform visualiser:
 ![Music player with waveform](ss/7.png)
 
 ![Sound-effect player](ss/8.png)
+
+Play any spell or ability effect on its own stage:
+
+![Haste spell effect](ss/15.png)
+
+![Behemoth's Meteor filling the stage](ss/16.png)
+
+Inspect any DAT's structure — folders, sections and what lives in each — and
+browse the FTABLE/VTABLE file-id → DAT mapping:
+
+![Entity DAT structure with animations, textures and meshes](ss/12.png)
+
+![Zone DAT structure: weather folders, sound pointers, generators](ss/13.png)
+
+![File table: every file id resolved to its DAT path](ss/11.png)
 
 ---
 

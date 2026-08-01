@@ -35,7 +35,7 @@ const MENUS = [
     label: 'Assets',
     items: [
       { id: 'assets-files', label: 'File Browser', icon: 'folder_open' },
-      { id: 'assets-data', label: 'Data', icon: 'database', disabled: true },
+      { id: 'assets-data', label: 'Data', icon: 'database' },
       { id: 'assets-images', label: 'Images', icon: 'image' },
       { id: 'assets-scene', label: 'Scene', icon: 'grass' },
       { id: 'assets-zones', label: 'Zones', icon: 'map' },

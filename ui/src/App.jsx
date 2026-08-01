@@ -36,6 +36,9 @@ import { EffectList } from './EffectList.jsx';
 import { WeatherAudio } from '../js/particle/audio.js';
 import { toAudioBuffer, parseAudioHeader, FMT_ATRAC3 } from '../js/audio.js';
 import { parseImageDat, textureForSet } from '../js/images.js';
+import { inspectDat } from '../js/dat/inspect.js';
+import { matchTablePath, parseFileTable } from '../js/dat/ftable.js';
+import { DataViewer } from './DataViewer.jsx';
 import { ImageList } from './ImageList.jsx';
 import { ImageSetPanel } from './ImageSetPanel.jsx';
 import { ImageViewer } from './ImageViewer.jsx';
@@ -49,7 +52,7 @@ const LAST_DAT_KEY = 'lastDat';
 const LAST_VIEW_KEY = 'lastView';
 const LAST_IMAGE_KEY = 'lastImage';
 const ANIM_SEL_KEY = 'lastAnimSel';
-const VIEWS = ['files', 'npc', 'pc', 'music', 'sfx', 'scene', 'zones', 'images', 'effects'];
+const VIEWS = ['files', 'npc', 'pc', 'music', 'sfx', 'scene', 'zones', 'images', 'effects', 'data'];
 /** Views that browse individual models, where fly controls are a hindrance. */
 const ORBIT_VIEWS = new Set(['files', 'npc', 'pc']);
 /** Views with a Details panel — model/zone stats, or an effect's sprite images. */
@@ -1327,7 +1330,7 @@ export default function App() {
           return;
         }
         // Lists that own no model on boot — don't resurrect the last DAT behind them.
-        if (restoredView === 'music' || restoredView === 'sfx' || restoredView === 'effects') return;
+        if (restoredView === 'music' || restoredView === 'sfx' || restoredView === 'effects' || restoredView === 'data') return;
 
         // Prefer the last successfully loaded DAT; fall back to the default demo model.
         let paths = null;
@@ -1565,6 +1568,77 @@ export default function App() {
   const [imageDoc, setImageDoc] = useState(null);       // parseImageDat result + resolved sets
   const [imageSet, setImageSet] = useState(null);
 
+  // ── Assets > Data (DAT structure inspector) ────────────────────────────────
+  const [dataDoc, setDataDoc] = useState(null);         // inspectDat result + path
+  const dataTokenRef = useRef(0);                       // drop stale reads
+  const dataBufRef = useRef(null);                      // raw buffer, for texture decode on click
+  const dataTexturesRef = useRef(null);                 // lazy parseDatTextures cache
+
+  const loadDatData = useCallback(async (path) => {
+    const token = ++dataTokenRef.current;
+    const rel = relativeName(path);
+    setStatusText(`Reading ${rel}…`);
+    try {
+      // FTABLE/VTABLE pairs get the id → DAT listing, not a section walk.
+      const table = matchTablePath(path);
+      let doc;
+      if (table) {
+        const dir = path.slice(0, path.length - path.split(/[\\/]/).pop().length);
+        const siblingPath = `${dir}${table.siblingName}`;
+        const [own, sibling] = await Promise.all([backend.readFile(path), backend.readFile(siblingPath)]);
+        if (token !== dataTokenRef.current) return;
+        const [ftBuf, vtBuf] = table.kind === 'ftable' ? [own, sibling] : [sibling, own];
+        doc = {
+          kind: 'ftable',
+          ...parseFileTable(ftBuf, vtBuf),
+          romIdx: table.romIdx,
+          siblingName: table.siblingName,
+          fileSize: own.byteLength,
+          siblingSize: sibling.byteLength,
+        };
+        dataBufRef.current = null;
+      } else {
+        const buf = await backend.readFile(path);
+        if (token !== dataTokenRef.current) return;
+        doc = inspectDat(buf);
+        dataBufRef.current = buf;
+      }
+      dataTexturesRef.current = null;
+      setDataDoc({ ...doc, path: rel });
+      setSelectedDat(path.toLowerCase());
+      setModelPath(rel);
+      shownPathRef.current = path;
+      setStatusText(doc.kind === 'sections'
+        ? `${doc.sectionCount.toLocaleString()} sections · ${doc.dirCount.toLocaleString()} folder${doc.dirCount === 1 ? '' : 's'}`
+        : doc.kind === 'ftable'
+          ? `${doc.registered.toLocaleString()} of ${doc.capacity.toLocaleString()} file ids registered`
+          : doc.label);
+    } catch (e) {
+      if (token !== dataTokenRef.current) return;
+      setDataDoc(null);
+      setStatusText(`Failed to read ${rel}: ${e.message ?? e}`);
+    }
+  }, []);
+
+  /** A row in the file-table view names a DAT — jump the inspector to it. */
+  const openDatFromTable = useCallback((datRel) => {
+    const gamePath = settingsRef.current?.gamePath;
+    if (!gamePath) return;
+    const abs = `${gamePath}\\${datRel.replace(/\//g, '\\')}`;
+    setRevealTarget(abs.toLowerCase());
+    loadDatData(abs);
+  }, [loadDatData]);
+
+  /** Decode this DAT's 0x20 textures on first click and open the viewer. */
+  const openDataTexture = useCallback((name) => {
+    if (!dataTexturesRef.current && dataBufRef.current) {
+      try { dataTexturesRef.current = parseDatTextures(dataBufRef.current); } catch { dataTexturesRef.current = new Map(); }
+    }
+    const tex = dataTexturesRef.current?.get(name);
+    if (tex) openTexture(tex);
+    else setStatusText(`Couldn't decode texture ${name}`);
+  }, [openTexture]);
+
   /** Drop the scene and everything that described it. */
   const unloadModel = useCallback(() => {
     rendererRef.current?.setModel(null);
@@ -1601,6 +1675,7 @@ export default function App() {
     if (!(ZONE_VIEWS.has(prev) && ZONE_VIEWS.has(leftView))) unloadModel();
     if (!(AUDIO_VIEWS.has(prev) && AUDIO_VIEWS.has(leftView))) player.stop();
     if (leftView !== 'images') { setImageEntry(null); setImageDoc(null); setImageSet(null); }
+    if (leftView !== 'data') { setDataDoc(null); dataBufRef.current = null; dataTexturesRef.current = null; }
     setShowAxes(leftView === 'effects');   // per-view default; the toggle still overrides
     // Leaving Effects: unloadModel already tore down the particle scene; drop the
     // selection so returning starts clean instead of showing dead transport rows.
@@ -1837,6 +1912,9 @@ export default function App() {
       case 'assets-files':
         setLeftView('files');
         break;
+      case 'assets-data':
+        setLeftView('data');
+        break;
       case 'assets-npcs':
         setLeftView('npc');
         break;
@@ -1862,8 +1940,9 @@ export default function App() {
         setLeftView('effects');
         break;
       case 'open-dat':
+        // In the Data view an opened DAT gets inspected, not loaded as a model.
         backend.pickFile(settingsRef.current?.gamePath || null)
-          .then((file) => { if (file) loadFromTree(file); })
+          .then((file) => { if (file) (leftView === 'data' ? loadDatData : loadFromTree)(file); })
           .catch((err) => setStatusText(`Open DAT failed: ${err.message ?? err}`));
         break;
       case 'help':
@@ -2061,6 +2140,22 @@ export default function App() {
 
       {explorerOpen && leftView === 'effects' && (
         <EffectList onSelect={loadEffect} selectedPath={effectEntry?.path} />
+      )}
+
+      {/* Data view reuses the File Explorer's tree; clicking a DAT inspects its
+          structure instead of loading it into the 3D scene. */}
+      {explorerOpen && leftView === 'data' && (
+        <FileTree
+          rootPath={settings?.gamePath ?? ''}
+          selectedPath={selectedDat}
+          revealTarget={revealTarget}
+          onSelectFile={loadDatData}
+          onError={(msg) => setStatusText(msg)}
+        />
+      )}
+
+      {leftView === 'data' && (
+        <DataViewer doc={dataDoc} onOpenTexture={openDataTexture} onOpenDat={openDatFromTable} />
       )}
 
       {leftView === 'images' && imageDoc && (
