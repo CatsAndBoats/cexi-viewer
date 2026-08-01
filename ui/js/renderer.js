@@ -386,6 +386,9 @@ export class Renderer {
     };
     this.zoneBatches = [];
     this.zoneDisableCull = false;   // debug: ignore the per-submesh cull flag
+    // Coplanar water/overlay submeshes: retail-style LEQUAL lets equal-depth blend
+    // fragments pass. Off = strict LESS (old behaviour) for A/B comparison.
+    this.zoneBlendLequal = true;
     // xim WindFactor: a 0→1→0 triangle wave, 2 seconds per leg.
     this.windFactor = 0;
     this.windDir = 1;
@@ -1548,16 +1551,17 @@ export class Renderer {
    * Zone terrain, drawn in authored DAT order with per-submesh state — the
    * faithful shape of xim's GLDrawer.drawXim loop:
    *
-   *   blend submesh : BLEND(SRC_ALPHA, ONE_MINUS_SRC_ALPHA, FUNC_ADD), depthMask off,
-   *                   POLYGON_OFFSET_FILL polygonOffset(-zBias, 1)   [zBias = 5]
-   *   opaque submesh: BLEND off, depthMask on, no polygon offset
-   *   culling       : on (frontFace CW, cull BACK) unless the 0x2000 flag is set
-   *   discard       : 0.375 for '_' meshes, else none
-   *
-   * No global opaque/translucent split and no reordering: FFXI authored the DAT
-   * order so overlay/decal submeshes composite over the surfaces drawn before
-   * them. Sorting or bucketing here is exactly what breaks that layering.
-   */
+    *   blend submesh : BLEND(SRC_ALPHA, ONE_MINUS_SRC_ALPHA, FUNC_ADD), depthMask off,
+    *                   POLYGON_OFFSET_FILL polygonOffset(-zBias, 1)   [zBias = 5],
+    *                   depthFunc LEQUAL when zoneBlendLequal (default) else LESS
+    *   opaque submesh: BLEND off, depthMask on, no polygon offset, depthFunc LESS
+    *   culling       : on (frontFace CW, cull BACK) unless the 0x2000 flag is set
+    *   discard       : 0.375 for '_' meshes, else none
+    *
+    * No global opaque/translucent split and no reordering: FFXI authored the DAT
+    * order so overlay/decal submeshes composite over the surfaces drawn before
+    * them. Sorting or bucketing here is exactly what breaks that layering.
+    */
   _drawZone(viewProj, eye, fogFar) {
     const gl = this.gl;
     if (this.zoneBatches.length === 0) return;
@@ -1594,6 +1598,7 @@ export class Renderer {
 
     // Track state so identical consecutive draws don't re-issue GL calls.
     let curBlend = null, curCull = null, curBias = null, curDiscard = null, curWind = null, curTex = null;
+    let curDepthFunc = gl.LESS;
 
     for (const batch of this.zoneBatches) {
       // Everything here is placed world geometry; sky shells and 0x05 effect
@@ -1612,6 +1617,14 @@ export class Renderer {
           gl.depthMask(true);
         }
         curBlend = blend;
+      }
+
+      // Blend overlays are often coplanar with the opaque base. LEQUAL keeps
+      // equal-depth fragments; LESS rejects them (looks like "broken blending").
+      const depthFunc = (blend && this.zoneBlendLequal) ? gl.LEQUAL : gl.LESS;
+      if (depthFunc !== curDepthFunc) {
+        gl.depthFunc(depthFunc);
+        curDepthFunc = depthFunc;
       }
 
       const cull = !batch.noCull && !this.zoneDisableCull;
@@ -1652,6 +1665,8 @@ export class Renderer {
       gl.bindVertexArray(batch.vao);
       gl.drawArrays(gl.TRIANGLES, 0, batch.count);
     }
+
+    if (curDepthFunc !== gl.LESS) gl.depthFunc(gl.LESS);
 
     if (usePolyMode) {
       this.polygonMode.polygonModeWEBGL(gl.FRONT_AND_BACK, this.polygonMode.FILL_WEBGL);

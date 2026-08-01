@@ -391,6 +391,8 @@ export default function App() {
   const [showGrid, setShowGrid] = useState(false);
   const [showSkeleton, setShowSkeleton] = useState(false);
   const [showAlpha, setShowAlpha] = useState(true);
+  // Zone blend submeshes: LEQUAL depth (on) vs strict LESS (off). Default on.
+  const [blendLequal, setBlendLequal] = useState(() => localStorage.getItem('blendLequal') !== '0');
   const [showUnlit, setShowUnlit] = useState(false);
   const [zoneBrightness, setZoneBrightness] = useState(0); // 0 = zone default, 1 = unlit
   const [showCollision, setShowCollision] = useState(false);
@@ -578,6 +580,9 @@ export default function App() {
   useEffect(() => {
     if (rendererRef.current) rendererRef.current.showAlpha = showAlpha;
   }, [showAlpha]);
+  useEffect(() => {
+    if (rendererRef.current) rendererRef.current.zoneBlendLequal = blendLequal;
+  }, [blendLequal]);
 
   useEffect(() => {
     if (rendererRef.current) rendererRef.current.unlit = showUnlit;
@@ -2140,6 +2145,14 @@ export default function App() {
           return next;
         });
         break;
+      case 'toggle-blend-lequal':
+        setBlendLequal((v) => {
+          const next = !v;
+          try { localStorage.setItem('blendLequal', next ? '1' : '0'); } catch { /* quota */ }
+          if (rendererRef.current) rendererRef.current.zoneBlendLequal = next;
+          return next;
+        });
+        break;
       case 'toggle-unlit':
         setShowUnlit((v) => {
           const next = !v;
@@ -2338,6 +2351,7 @@ export default function App() {
           wireframe: showWireframe,
           skeleton: showSkeleton,
           alpha: showAlpha,
+          blendLequal,
           unlit: showUnlit,
           explorer: explorerOpen,
           wasd,

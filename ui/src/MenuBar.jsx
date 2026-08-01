@@ -23,6 +23,7 @@ const MENUS = [
       { id: 'toggle-textures', label: 'Toggle Textures', icon: 'texture', check: 'textures' },
       { id: 'toggle-hd', label: 'Toggle HD', icon: 'hd', check: 'hd', disableWhen: 'noHdPath' },
       { id: 'toggle-alpha', label: 'Toggle Alpha', icon: 'opacity', check: 'alpha' },
+      { id: 'toggle-blend-lequal', label: 'Toggle Blend LEQUAL', icon: 'layers', check: 'blendLequal' },
       { id: 'toggle-unlit', label: 'Toggle Unlit', icon: 'light_mode', check: 'unlit' },
       { id: 'toggle-collision', label: 'Toggle Collision', icon: 'select_all', check: 'collision', disableWhen: 'noCollision' },
       { id: 'toggle-navmesh', label: 'Toggle Navmesh', icon: 'polyline', check: 'navmesh', disableWhen: 'noNavmesh' },
