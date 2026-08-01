@@ -1379,9 +1379,10 @@ export default function App() {
       if (particleSystem && environment) {
         const audio = getWeatherAudio();
         audio.attach(particleSystem, environment);
-        audio.setEnabled(localStorage.getItem('weatherAudio') !== '0');
-        audio.setVolume(sfxVolumeRef.current);
-        renderer.weatherAudio = audio;
+      audio.setEnabled(sfxOnRef.current && sfxVolumeRef.current > 0);
+      audio.setVolume(sfxVolumeRef.current);
+      renderer.weatherAudio = audio;
+      renderer.showSoundMarkers = localStorage.getItem('soundMarkers') === '1';
       }
 
       // Zone BGM. FFXI treats 18:00–06:00 as night for music purposes.
@@ -1959,21 +1960,45 @@ export default function App() {
   // can apply it without waiting for a re-render.
   const [sfxVolume, setSfxVolumeState] = useState(() => {
     const v = parseFloat(localStorage.getItem('sfxVolume'));
-    return Number.isFinite(v) ? v : 0.6;
+    return Number.isFinite(v) ? Math.min(1, Math.max(0, v)) : 0.6;
   });
   const sfxVolumeRef = useRef(sfxVolume);
   const setSfxVolume = useCallback((v) => {
-    sfxVolumeRef.current = v;
-    setSfxVolumeState(v);
-    try { localStorage.setItem('sfxVolume', String(v)); } catch { /* quota */ }
-    weatherAudioRef.current?.setVolume(v);
+    const clamped = Math.min(1, Math.max(0, v));
+    sfxVolumeRef.current = clamped;
+    setSfxVolumeState(clamped);
+    try { localStorage.setItem('sfxVolume', String(clamped)); } catch { /* quota */ }
+    const audio = weatherAudioRef.current;
+    if (!audio) return;
+    audio.setVolume(clamped);
+    // 0 on the slider is mute — same as the toggle, so nothing keeps mixing.
+    if (clamped <= 0) audio.setEnabled(false);
+    else if (sfxOnRef.current) audio.setEnabled(true);
   }, []);
 
   const [sfxOn, setSfxOnState] = useState(() => localStorage.getItem('weatherAudio') !== '0');
+  const sfxOnRef = useRef(sfxOn);
   const toggleSfx = useCallback((on) => {
+    sfxOnRef.current = on;
     setSfxOnState(on);
     try { localStorage.setItem('weatherAudio', on ? '1' : '0'); } catch { /* quota */ }
-    weatherAudioRef.current?.setEnabled(on);
+    const audio = weatherAudioRef.current;
+    if (!audio) return;
+    audio.setEnabled(on);
+    // Re-apply volume when turning back on (bed was stopped at mute).
+    if (on) audio.setVolume(sfxVolumeRef.current);
+  }, []);
+
+  const [showSoundMarkers, setShowSoundMarkers] = useState(
+    () => localStorage.getItem('soundMarkers') === '1',
+  );
+  useEffect(() => {
+    if (rendererRef.current) rendererRef.current.showSoundMarkers = showSoundMarkers;
+  }, [showSoundMarkers]);
+  const toggleSoundMarkers = useCallback((on) => {
+    setShowSoundMarkers(on);
+    try { localStorage.setItem('soundMarkers', on ? '1' : '0'); } catch { /* quota */ }
+    if (rendererRef.current) rendererRef.current.showSoundMarkers = on;
   }, []);
 
   const saveSettings = async (draft) => {
@@ -2170,6 +2195,9 @@ export default function App() {
           return next;
         });
         break;
+      case 'toggle-sound-markers':
+        toggleSoundMarkers(!showSoundMarkers);
+        break;
       // Particle effects on/off — water, spray, clouds, sun/moon, lights. Handy
       // for telling at a glance whether an artefact comes from the effect
       // runtime or from the zone's own geometry.
@@ -2357,6 +2385,7 @@ export default function App() {
           wasd,
           collision: showCollision,
           navmesh: showNavmesh,
+          soundMarkers: showSoundMarkers,
           skybox: showSkybox,
           effects: showEffects,
           axes: showAxes,
@@ -2490,6 +2519,8 @@ export default function App() {
           onSfxVolume={setSfxVolume}
           sfxOn={sfxOn}
           onToggleSfx={toggleSfx}
+          soundMarkersOn={showSoundMarkers}
+          onToggleSoundMarkers={toggleSoundMarkers}
           zoneTrack={zoneTrack}
           zoneTrackPlaying={
             !!zoneTrack && player.playing

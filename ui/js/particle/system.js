@@ -87,23 +87,36 @@ class AudioEmitter {
 
   update(particle) {
     if (!this.soundPointer) return;
-    const volume = this.#volume(this.#position(particle), particle);
-    const shouldCull = volume != null && volume <= 0;
+    const pos = this.#position(particle);
+    const volume = this.#volume(pos, particle);
+    // null = no range authored → full volume; 0 = out of range.
+    const atten = volume == null ? 1 : volume;
+    const shouldCull = atten <= 0;
 
-    if (!shouldCull && particle.emittedAudio.length === 0) {
+    particle.emittedAudio = particle.emittedAudio.filter((a) => !a.isComplete());
+
+    if (shouldCull) {
+      for (const a of particle.emittedAudio) a.stop();
+      particle.emittedAudio = [];
+      return;
+    }
+
+    if (particle.emittedAudio.length === 0) {
       const handle = this.system.playSoundEffect(this.soundPointer, particle.association, {
         looping: particle.audioConfiguration.looping,
         positionFn: () => this.#position(particle),
-        volumeFn: (pos) => this.#volume(pos, particle),
+        volumeFn: (p) => this.#volume(p, particle) ?? 1,
       });
       if (handle) particle.emittedAudio.push(handle);
     }
 
-    if (shouldCull) {
-      for (const a of particle.emittedAudio) a.stop();
-      particle.emittedAudio = particle.emittedAudio.filter((a) => !a.isComplete());
-    }
+    // Keep attenuation in lockstep with the camera — without this a waterfall
+    // started at full volume stays loud as you walk away.
+    for (const a of particle.emittedAudio) a.setAttenuation?.(atten);
   }
+
+  /** World-space position used for markers / debug (path-snapped when authored). */
+  markerPosition(particle) { return this.#position(particle); }
 
   #position(particle) {
     const path = particle.audioConfiguration.pathLink?.getIfPresent();
@@ -542,6 +555,38 @@ export class ParticleSystem {
 
   playSoundEffect(soundPointer, association, opts) {
     return this.audioBackend?.play(soundPointer, association, opts) ?? null;
+  }
+
+  /**
+   * Live positional sound sources for the marker overlay: every zone/weather
+   * audio particle, path-snapped when a shoreline path is authored. Positions
+   * are raw DAT space (caller applies display transform).
+   */
+  listSoundMarkers() {
+    const out = [];
+    for (const { particle } of this.getAllParticles()) {
+      if (!particle.audioEmitter && particle.config?.linkedDataType !== LinkedDataType.Audio) continue;
+      const pos = particle.audioEmitter?.markerPosition?.(particle)
+        ?? particle.getWorldSpacePosition?.()
+        ?? null;
+      if (!pos) continue;
+      const cfg = particle.audioConfiguration ?? {};
+      const cam = this.camera?.getPosition?.();
+      let active = true;
+      if (cam && cfg.farDistance > 0) {
+        const d = Vec3.distance(pos, cam);
+        active = d < cfg.farDistance;
+      }
+      out.push({
+        id: particle.datId,
+        soundId: particle.audioEmitter?.soundPointer?.soundId ?? null,
+        x: pos.x, y: pos.y, z: pos.z,
+        far: cfg.farDistance || 0,
+        near: cfg.nearDistance || 0,
+        active,
+      });
+    }
+    return out;
   }
 
   // ── environment bridges ──────────────────────────────────────────────────

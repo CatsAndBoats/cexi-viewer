@@ -42,17 +42,22 @@ class Voice {
     this.source.start();
   }
 
+  /** Snap gain immediately — cancels any in-flight fade/ramp. */
   setVolume(v) {
     if (this.stopped) return;
-    this.gain.gain.setTargetAtTime(v, this.ctx.currentTime, 0.05);
+    const now = this.ctx.currentTime;
+    const g = this.gain.gain;
+    g.cancelScheduledValues(now);
+    g.setValueAtTime(Math.max(0, v), now);
   }
 
   fadeTo(target, seconds) {
     if (this.stopped) return;
     const now = this.ctx.currentTime;
-    this.gain.gain.cancelScheduledValues(now);
-    this.gain.gain.setValueAtTime(this.gain.gain.value, now);
-    this.gain.gain.linearRampToValueAtTime(target, now + seconds);
+    const g = this.gain.gain;
+    g.cancelScheduledValues(now);
+    g.setValueAtTime(g.value, now);
+    g.linearRampToValueAtTime(Math.max(0, target), now + Math.max(0.001, seconds));
   }
 
   stopAfter(seconds = 0) {
@@ -93,6 +98,9 @@ export class WeatherAudio {
     this._pending = null;        // soundId currently being loaded
     this._buffers = new Map();   // soundId -> { buffer, loopStart } | null
     this._lastKey = null;
+    // Voices mid-crossfade are detached from _current so a mute/stop must still
+    // reach them — otherwise "toggle off" leaves the fading bed audible.
+    this._fading = [];
     // Every one-shot handed out by play(). Without this, stopAll() only silenced
     // the ambient bed and a fired one-shot ran to completion no matter what —
     // so switching effect (or view) left the previous effect's sounds playing
@@ -115,13 +123,25 @@ export class WeatherAudio {
 
   setVolume(v) {
     this.volume = Math.max(0, Math.min(1, v));
+    // 0 must be silent immediately — setTarget ramps fight in-flight fadeTo.
     this._current?.voice.setVolume(this.volume);
+    for (const voice of this._fading) voice.setVolume(0);
+    for (const h of this._oneShots) h.setMasterVolume?.(this.volume);
+    // Volume 0: stop the bed so nothing is decoding/mixing under the floor.
+    if (this.volume <= 0 && this._current) {
+      this._current.voice.stop();
+      this._current = null;
+      this._lastKey = null;
+    }
   }
 
   stopAll() {
     this._current?.voice.stop();
     this._current = null;
     this._lastKey = null;
+    this._pending = null;
+    for (const voice of this._fading) voice.stop();
+    this._fading.length = 0;
     this.stopOneShots();
   }
 
@@ -144,7 +164,8 @@ export class WeatherAudio {
    * actually moved.
    */
   update() {
-    if (!this.enabled || !this.system || !this.environment) return;
+    this._fading = this._fading.filter((v) => !v.isComplete());
+    if (!this.enabled || this.volume <= 0 || !this.system || !this.environment) return;
 
     const weather = this.environment.getWeather();
     const dir = this.system.getWeatherDirectory(weather);
@@ -189,14 +210,15 @@ export class WeatherAudio {
     if (previous) {
       previous.voice.fadeTo(0, 3.33);
       previous.voice.stopAfter(3.4);
+      this._fading.push(previous.voice);
     }
     this._current = null;
-    if (soundId == null) return;
+    if (soundId == null || this.volume <= 0) return;
 
     this._pending = soundId;
     const sound = await this._buffer(soundId);
     // A newer switch landed while this was decoding.
-    if (this._pending !== soundId || !sound || !this.enabled) return;
+    if (this._pending !== soundId || !sound || !this.enabled || this.volume <= 0) return;
 
     const ctx = this.getContext?.();
     if (!ctx) return;
@@ -226,25 +248,52 @@ export class WeatherAudio {
 
   /**
    * ParticleSystem.playSoundEffect hook: a particle-attached one-shot or loop
-   * with distance attenuation supplied by the caller.
+   * with distance attenuation supplied by the caller. Callers that pass
+   * volumeFn should keep calling handle.setAttenuation each frame so volume
+   * tracks the camera.
    */
   play(soundPointer, association, { looping = false, positionFn = null, volumeFn = null } = {}) {
-    if (!this.enabled || !soundPointer) return null;
+    if (!this.enabled || this.volume <= 0 || !soundPointer) return null;
 
+    const backend = this;
+    const applyVol = (h) => {
+      if (h.stopped || !h.voice) return;
+      h.voice.setVolume(h.masterVolume * h.attenuation);
+    };
     const handle = {
       voice: null,
       stopped: false,
+      masterVolume: backend.volume,
+      attenuation: 1,
       stop() { this.voice?.stop(); this.stopped = true; },
       isComplete() { return this.stopped || (this.voice ? this.voice.isComplete() : false); },
+      setMasterVolume(v) {
+        this.masterVolume = v;
+        applyVol(this);
+      },
+      setAttenuation(a) {
+        this.attenuation = Math.max(0, a);
+        if (this.attenuation <= 0 && this.voice) {
+          this.voice.stop();
+          this.stopped = true;
+          return;
+        }
+        applyVol(this);
+      },
     };
 
     this._buffer(soundPointer.soundId).then((sound) => {
-      if (!sound || handle.stopped || !this.enabled) return;
-      const ctx = this.getContext?.();
+      if (!sound || handle.stopped || !backend.enabled || backend.volume <= 0) return;
+      const ctx = backend.getContext?.();
       if (!ctx) return;
       const attenuation = volumeFn ? (volumeFn(positionFn?.()) ?? 1) : 1;
-      if (attenuation <= 0) { handle.stopped = true; return; }
-      handle.voice = new Voice(ctx, sound, { looping, volume: this.volume * attenuation });
+      if (attenuation <= 0) return; // leave handle alive so AudioEmitter can retry when closer
+      handle.attenuation = attenuation;
+      handle.masterVolume = backend.volume;
+      handle.voice = new Voice(ctx, sound, {
+        looping,
+        volume: handle.masterVolume * handle.attenuation,
+      });
     });
 
     this._oneShots = this._oneShots.filter((h) => !h.isComplete());

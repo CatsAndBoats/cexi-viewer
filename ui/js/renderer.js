@@ -275,6 +275,38 @@ void main() {
 }
 `;
 
+// Camera-facing sound markers (zone positional SFX). Drawn as soft discs so
+// they stay readable at any distance; colour encodes in-range vs out-of-range.
+const MARKER_VERTEX_SHADER = `#version 300 es
+precision highp float;
+layout(location=0) in vec3 aPos;
+layout(location=1) in vec3 aColor;
+uniform mat4 uViewProj;
+uniform float uPointSize;
+out vec3 vColor;
+void main() {
+  vColor = aColor;
+  gl_Position = uViewProj * vec4(aPos, 1.0);
+  gl_PointSize = uPointSize;
+}
+`;
+
+const MARKER_FRAGMENT_SHADER = `#version 300 es
+precision highp float;
+in vec3 vColor;
+out vec4 outColor;
+void main() {
+  vec2 p = gl_PointCoord * 2.0 - 1.0;
+  float r = length(p);
+  if (r > 1.0) discard;
+  // Ring + soft centre so markers read as "speaker" blobs.
+  float ring = smoothstep(0.55, 0.45, r) * smoothstep(1.0, 0.75, r);
+  float core = smoothstep(0.45, 0.0, r);
+  float a = max(ring, core * 0.85);
+  outColor = vec4(vColor, a);
+}
+`;
+
 // --- Sky dome (xim SkyBoxMesh): vertex-coloured gradient dome, camera-centred,
 // unlit, drawn behind everything. uCenter follows the eye so it wraps the free
 // camera (xim leaves it at the world origin; zones are authored around it). ----
@@ -431,6 +463,21 @@ export class Renderer {
       viewProj: gl.getUniformLocation(this.overlayProgram, 'uViewProj'),
       opacity: gl.getUniformLocation(this.overlayProgram, 'uOpacity'),
     };
+    this.markerProgram = buildProgram(gl, MARKER_VERTEX_SHADER, MARKER_FRAGMENT_SHADER);
+    this.markerUniforms = {
+      viewProj: gl.getUniformLocation(this.markerProgram, 'uViewProj'),
+      pointSize: gl.getUniformLocation(this.markerProgram, 'uPointSize'),
+    };
+    this.markerVao = gl.createVertexArray();
+    this.markerVbo = gl.createBuffer();
+    gl.bindVertexArray(this.markerVao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.markerVbo);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 24, 0);
+    gl.enableVertexAttribArray(1);
+    gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 24, 12);
+    gl.bindVertexArray(null);
+    this.markerCount = 0;
     // Sky dome program (xim SkyBoxMesh). Built per-zone from the 0x2F skybox.
     this.skyProgram = buildProgram(gl, SKY_VERTEX_SHADER, SKY_FRAGMENT_SHADER);
     this.skyUniforms = {
@@ -444,6 +491,7 @@ export class Renderer {
     this.navmeshOverlay = null;
     this.showCollision = false;
     this.showNavmesh = false;
+    this.showSoundMarkers = false;  // zone positional SFX (waterfalls, surf)
     this.showSkybox = false;
     this.collisionOpacity = 0.45;
     this.navmeshOpacity = 0.40;
@@ -1404,6 +1452,7 @@ export class Renderer {
       this._drawParticles();
       this._drawOverlay(viewProj, this.showCollision ? this.collisionOverlay : null, this.collisionOpacity);
       this._drawOverlay(viewProj, this.showNavmesh ? this.navmeshOverlay : null, this.navmeshOpacity);
+      if (this.showSoundMarkers) this._drawSoundMarkers(viewProj);
       if (this.showGrid) this._drawGrid(viewProj);
       if (this.showAxes) this._drawAxes(viewProj);
       gl.depthMask(true);
@@ -1829,6 +1878,46 @@ export class Renderer {
     gl.polygonOffset(-1, -1); // sit just above the terrain
     gl.bindVertexArray(overlay.vao);
     gl.drawArrays(gl.TRIANGLES, 0, overlay.count);
+    gl.bindVertexArray(null);
+  }
+
+  /**
+   * Positional zone SFX markers (waterfalls, shoreline beds). DAT space →
+   * display (−x,−y,z); in-range sources are cyan, out-of-range dim purple.
+   */
+  _drawSoundMarkers(viewProj) {
+    const system = this.particleSystem;
+    if (!system?.listSoundMarkers) return;
+    const markers = system.listSoundMarkers();
+    const gl = this.gl;
+    const n = markers.length;
+    this.markerCount = n;
+    if (!n) return;
+
+    const data = new Float32Array(n * 6);
+    for (let i = 0; i < n; i++) {
+      const m = markers[i];
+      const o = i * 6;
+      data[o] = -m.x; data[o + 1] = -m.y; data[o + 2] = m.z;
+      if (m.active) { data[o + 3] = 0.25; data[o + 4] = 0.95; data[o + 5] = 0.95; }
+      else { data[o + 3] = 0.55; data[o + 4] = 0.35; data[o + 5] = 0.85; }
+    }
+
+    gl.bindVertexArray(this.markerVao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.markerVbo);
+    gl.bufferData(gl.ARRAY_BUFFER, data, gl.DYNAMIC_DRAW);
+
+    gl.useProgram(this.markerProgram);
+    gl.uniformMatrix4fv(this.markerUniforms.viewProj, false, viewProj);
+    gl.uniform1f(this.markerUniforms.pointSize, 18);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    gl.depthMask(false);
+    gl.disable(gl.CULL_FACE);
+    // Keep markers visible through light geometry so you can find buried emitters.
+    gl.disable(gl.DEPTH_TEST);
+    gl.drawArrays(gl.POINTS, 0, n);
+    gl.enable(gl.DEPTH_TEST);
     gl.bindVertexArray(null);
   }
 }

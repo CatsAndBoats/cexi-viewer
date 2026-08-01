@@ -27,6 +27,7 @@ const MENUS = [
       { id: 'toggle-unlit', label: 'Toggle Unlit', icon: 'light_mode', check: 'unlit' },
       { id: 'toggle-collision', label: 'Toggle Collision', icon: 'select_all', check: 'collision', disableWhen: 'noCollision' },
       { id: 'toggle-navmesh', label: 'Toggle Navmesh', icon: 'polyline', check: 'navmesh', disableWhen: 'noNavmesh' },
+      { id: 'toggle-sound-markers', label: 'Toggle Sound Markers', icon: 'spatial_audio', check: 'soundMarkers' },
       { id: 'toggle-skybox', label: 'Toggle Skybox', icon: 'cloud', check: 'skybox', disableWhen: 'noSkybox' },
       { id: 'toggle-effects', label: 'Toggle Effects', icon: 'auto_awesome', check: 'effects' },
       { id: 'toggle-axes', label: 'Toggle Axes', icon: 'open_with', check: 'axes' },
