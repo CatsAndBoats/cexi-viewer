@@ -1547,3 +1547,24 @@ input[type='color'] {
   color: var(--gray-500);
   font-size: 11px;
 }
+
+/* File-table category chips (All / Gear / Mobs & NPCs) */
+.data-cats { display: flex; gap: 4px; flex: 0 0 auto; }
+.data-cat {
+  padding: 3px 9px;
+  min-height: 0;
+  background: transparent;
+  border: 1px solid var(--ring-strong);
+  border-radius: 999px;
+  box-shadow: none;
+  color: var(--muted);
+  font: 500 11px/1.4 var(--font-ui);
+  cursor: pointer;
+}
+.data-cat:hover { color: var(--text); background: rgba(255, 255, 255, 0.07); }
+.data-cat.on {
+  background: linear-gradient(180deg, var(--accent), var(--accent-deep));
+  border-color: var(--accent-deep);
+  color: #0b1420;
+}
+.data-census-sep { height: 1px; margin: 6px 12px; background: var(--ring); }

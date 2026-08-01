@@ -34,7 +34,8 @@ Get the latest release by going to: [Github Releases](https://github.com/CatsAnd
   types, header peeks like texture size/format, joint counts, sound ids) without
   dumping payloads; textures open in a viewer on click. FTABLE/VTABLE pairs
   render as a searchable file-id → DAT table whose rows jump straight to the
-  named DAT's structure.
+  named DAT's structure, with gear model ids browsable per race/slot and
+  monster/NPC model ids resolved from the same tables.
 - **Throughout** — type-to-filter dropdowns, arrow-key list navigation,
   reveal-any-DAT in the system file manager, wireframe / unlit / collision /
   navmesh / skybox overlays, and glTF/FBX model export (via the cexi-tools CLI).
@@ -79,6 +80,8 @@ browse the FTABLE/VTABLE file-id → DAT mapping:
 ![Zone DAT structure: weather folders, sound pointers, generators](ss/13.png)
 
 ![File table: every file id resolved to its DAT path](ss/11.png)
+
+![Gear model ids per race and slot](ss/14.png)
 
 ---
 
