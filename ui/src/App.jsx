@@ -1379,10 +1379,11 @@ export default function App() {
       if (particleSystem && environment) {
         const audio = getWeatherAudio();
         audio.attach(particleSystem, environment);
-      audio.setEnabled(sfxOnRef.current && sfxVolumeRef.current > 0);
-      audio.setVolume(sfxVolumeRef.current);
-      renderer.weatherAudio = audio;
-      renderer.showSoundMarkers = localStorage.getItem('soundMarkers') === '1';
+        // Zone ambient uses sfxVolume / sfxOn (Weather panel), not the effect-viewer volume.
+        audio.setVolume(sfxVolumeRef.current);
+        audio.setEnabled(!!sfxOnRef.current && sfxVolumeRef.current > 0);
+        renderer.weatherAudio = audio;
+        renderer.showSoundMarkers = localStorage.getItem('soundMarkers') === '1';
       }
 
       // Zone BGM. FFXI treats 18:00–06:00 as night for music purposes.
@@ -1968,26 +1969,25 @@ export default function App() {
     sfxVolumeRef.current = clamped;
     setSfxVolumeState(clamped);
     try { localStorage.setItem('sfxVolume', String(clamped)); } catch { /* quota */ }
-    const audio = weatherAudioRef.current;
-    if (!audio) return;
+    // Ensure the backend exists so the first slider move before a zone finishes
+    // loading still sticks when the bed starts. Resume on this user gesture.
+    const audio = weatherAudioRef.current ?? getWeatherAudio();
+    audio.getContext();
     audio.setVolume(clamped);
-    // 0 on the slider is mute — same as the toggle, so nothing keeps mixing.
-    if (clamped <= 0) audio.setEnabled(false);
-    else if (sfxOnRef.current) audio.setEnabled(true);
-  }, []);
+  }, [getWeatherAudio]);
 
   const [sfxOn, setSfxOnState] = useState(() => localStorage.getItem('weatherAudio') !== '0');
   const sfxOnRef = useRef(sfxOn);
   const toggleSfx = useCallback((on) => {
-    sfxOnRef.current = on;
-    setSfxOnState(on);
-    try { localStorage.setItem('weatherAudio', on ? '1' : '0'); } catch { /* quota */ }
-    const audio = weatherAudioRef.current;
-    if (!audio) return;
-    audio.setEnabled(on);
-    // Re-apply volume when turning back on (bed was stopped at mute).
-    if (on) audio.setVolume(sfxVolumeRef.current);
-  }, []);
+    const next = !!on;
+    sfxOnRef.current = next;
+    setSfxOnState(next);
+    try { localStorage.setItem('weatherAudio', next ? '1' : '0'); } catch { /* quota */ }
+    const audio = weatherAudioRef.current ?? getWeatherAudio();
+    audio.getContext(); // user gesture — unlock / resume AudioContext
+    audio.setVolume(sfxVolumeRef.current);
+    audio.setEnabled(next);
+  }, [getWeatherAudio]);
 
   const [showSoundMarkers, setShowSoundMarkers] = useState(
     () => localStorage.getItem('soundMarkers') === '1',
@@ -2519,8 +2519,6 @@ export default function App() {
           onSfxVolume={setSfxVolume}
           sfxOn={sfxOn}
           onToggleSfx={toggleSfx}
-          soundMarkersOn={showSoundMarkers}
-          onToggleSoundMarkers={toggleSoundMarkers}
           zoneTrack={zoneTrack}
           zoneTrackPlaying={
             !!zoneTrack && player.playing

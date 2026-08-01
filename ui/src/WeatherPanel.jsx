@@ -30,7 +30,6 @@ export function WeatherPanel({
   fogOn = true, onFogOn, fogScale = 1, onFogScale,
   musicVolume = 0.8, onMusicVolume, sfxVolume = 0.6, onSfxVolume,
   sfxOn = true, onToggleSfx,
-  soundMarkersOn = false, onToggleSoundMarkers,
   zoneTrack = null, zoneTrackPlaying = false, onToggleZoneMusic,
 }) {
   const showSkyControls = hasSkybox && weathers.length > 0;
@@ -207,15 +206,6 @@ export function WeatherPanel({
             style={{ '--fill': `${sfxPct}%` }}
           />
           <span className="wx-bright-val mono">{sfxPct}%</span>
-          <Tooltip content={soundMarkersOn ? 'Hide sound markers' : 'Show sound markers (waterfalls, surf…)'} placement="left">
-            <button
-              className={`wx-audio-btn${soundMarkersOn ? ' playing' : ''}`}
-              aria-pressed={soundMarkersOn}
-              onClick={() => onToggleSoundMarkers?.(!soundMarkersOn)}
-            >
-              <span className="icon">spatial_audio</span>
-            </button>
-          </Tooltip>
         </div>
 
         <div className="wx-row wx-bright-row">

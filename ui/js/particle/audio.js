@@ -8,6 +8,10 @@
 // come from.
 //
 // Sound ids map to <root>/sound/win/se/seNNN/seNNNNNN.spw.
+//
+// All voices route through a single master GainNode so zone ambient volume/mute
+// always wins, even if a crossfade left an orphan source or a positional SFX
+// started before the slider moved.
 
 import { SEC } from '../dat/tree.js';
 
@@ -17,14 +21,14 @@ export const soundPath = (soundId) => {
   return `sound\\win\\se\\se${folder}\\se${file}.spw`;
 };
 
-/** A single playing sound with an independent gain ramp. */
+/** A single playing sound with an independent gain ramp into `output`. */
 class Voice {
-  constructor(ctx, sound, { looping, volume }) {
+  constructor(ctx, sound, { looping, volume, output }) {
     const { buffer, loopStart = 0 } = sound;
     this.ctx = ctx;
     this.gain = ctx.createGain();
     this.gain.gain.value = volume;
-    this.gain.connect(ctx.destination);
+    this.gain.connect(output);
 
     this.source = ctx.createBufferSource();
     this.source.buffer = buffer;
@@ -42,7 +46,7 @@ class Voice {
     this.source.start();
   }
 
-  /** Snap gain immediately — cancels any in-flight fade/ramp. */
+  /** Snap per-voice gain immediately — cancels any in-flight fade/ramp. */
   setVolume(v) {
     if (this.stopped) return;
     const now = this.ctx.currentTime;
@@ -69,6 +73,7 @@ class Voice {
     if (this.stopped) return;
     try { this.source.stop(); } catch { /* already stopped */ }
     this.stopped = true;
+    try { this.gain.disconnect(); } catch { /* already disconnected */ }
   }
 
   isComplete() { return this.stopped; }
@@ -86,13 +91,16 @@ class Voice {
  */
 export class WeatherAudio {
   constructor({ getContext, loadSound, volume = 0.6 }) {
-    this.getContext = getContext;
+    this._getContextRaw = getContext;
     this.loadSound = loadSound;
-    this.volume = volume;
+    this.volume = Math.max(0, Math.min(1, volume));
     this.enabled = false;
 
     this.system = null;
     this.environment = null;
+
+    this._ctx = null;
+    this._master = null;         // GainNode — every Voice connects here
 
     this._current = null;        // { soundId, voice }
     this._pending = null;        // soundId currently being loaded
@@ -101,11 +109,37 @@ export class WeatherAudio {
     // Voices mid-crossfade are detached from _current so a mute/stop must still
     // reach them — otherwise "toggle off" leaves the fading bed audible.
     this._fading = [];
-    // Every one-shot handed out by play(). Without this, stopAll() only silenced
-    // the ambient bed and a fired one-shot ran to completion no matter what —
-    // so switching effect (or view) left the previous effect's sounds playing
-    // over the new one, which reads as a sound firing at a wild delay.
     this._oneShots = [];
+  }
+
+  /** AudioContext + master bus. Master gain is the zone ambient volume knob. */
+  getContext() {
+    if (this._ctx) {
+      if (this._ctx.state === 'suspended') this._ctx.resume();
+      return this._ctx;
+    }
+    const ctx = this._getContextRaw?.();
+    if (!ctx) return null;
+    this._ctx = ctx;
+    this._master = ctx.createGain();
+    this._applyMasterGain();
+    this._master.connect(ctx.destination);
+    if (ctx.state === 'suspended') ctx.resume();
+    return ctx;
+  }
+
+  /** Effective linear gain on the master bus (0 when muted). */
+  _masterGainValue() {
+    if (!this.enabled || this.volume <= 0) return 0;
+    return this.volume;
+  }
+
+  _applyMasterGain() {
+    if (!this._master || !this._ctx) return;
+    const now = this._ctx.currentTime;
+    const g = this._master.gain;
+    g.cancelScheduledValues(now);
+    g.setValueAtTime(this._masterGainValue(), now);
   }
 
   attach(system, environment) {
@@ -117,41 +151,46 @@ export class WeatherAudio {
 
   setEnabled(on) {
     this.enabled = !!on;
-    if (!this.enabled) this.stopAll();
-    else this._lastKey = null;    // force a re-pick on the next update
+    this._applyMasterGain();
+    if (!this.enabled) {
+      this.stopAll();
+    } else {
+      this._lastKey = null;    // force a re-pick on the next update
+    }
   }
 
   setVolume(v) {
     this.volume = Math.max(0, Math.min(1, v));
-    // 0 must be silent immediately — setTarget ramps fight in-flight fadeTo.
-    this._current?.voice.setVolume(this.volume);
-    for (const voice of this._fading) voice.setVolume(0);
-    for (const h of this._oneShots) h.setMasterVolume?.(this.volume);
-    // Volume 0: stop the bed so nothing is decoding/mixing under the floor.
-    if (this.volume <= 0 && this._current) {
-      this._current.voice.stop();
-      this._current = null;
-      this._lastKey = null;
+    this._applyMasterGain();
+    // Per-voice relative levels stay at their authored attenuation; master
+    // scales everything. Still snap one-shot bookkeeping so a later unmute
+    // doesn't revive a voice that should have been culled.
+    for (const h of this._oneShots) h.setMasterVolume?.(1);
+    if (this.volume <= 0) {
+      // Keep enabled flag as the UI toggle; just silence + tear down bed so a
+      // pending decode can't fade back in under a zero slider.
+      this._stopBed();
     }
   }
 
-  stopAll() {
+  _stopBed() {
     this._current?.voice.stop();
     this._current = null;
     this._lastKey = null;
     this._pending = null;
     for (const voice of this._fading) voice.stop();
     this._fading.length = 0;
+  }
+
+  stopAll() {
+    this._stopBed();
     this.stopOneShots();
   }
 
   /**
    * Cancel every one-shot without touching the ambient bed — what changing the
    * effect (or its schedule) needs, so the outgoing effect takes its sounds with
-   * it. Covers both routine-scheduled sounds and particle-attached emitters,
-   * since every voice is handed out by play(). Handles whose buffer is still
-   * decoding are cancelled too: the `stopped` flag makes play() drop them when
-   * the decode lands.
+   * it.
    */
   stopOneShots() {
     for (const h of this._oneShots) h.stop();
@@ -165,13 +204,17 @@ export class WeatherAudio {
    */
   update() {
     this._fading = this._fading.filter((v) => !v.isComplete());
+    // Keep master in sync every frame — cheap, and recovers if the context was
+    // recreated or a browser ducked us.
+    this._applyMasterGain();
     if (!this.enabled || this.volume <= 0 || !this.system || !this.environment) return;
 
     const weather = this.environment.getWeather();
     const dir = this.system.getWeatherDirectory(weather);
     if (!dir) return;
 
-    const hhmm = this.environment.clock.currentHour() * 100 + this.environment.clock.currentMinuteOfHour();
+    const hhmm = this.environment.clock.currentHour() * 100
+      + this.environment.clock.currentMinuteOfHour();
     const key = `${weather}\0${this._todBucket(dir, hhmm)}`;
     if (key === this._lastKey) return;
     this._lastKey = key;
@@ -213,24 +256,24 @@ export class WeatherAudio {
       this._fading.push(previous.voice);
     }
     this._current = null;
-    if (soundId == null || this.volume <= 0) return;
+    if (soundId == null || this.volume <= 0 || !this.enabled) return;
 
     this._pending = soundId;
     const sound = await this._buffer(soundId);
     // A newer switch landed while this was decoding.
     if (this._pending !== soundId || !sound || !this.enabled || this.volume <= 0) return;
 
-    const ctx = this.getContext?.();
-    if (!ctx) return;
-    const voice = new Voice(ctx, sound, { looping: true, volume: 0 });
-    voice.fadeTo(this.volume, 3.33);
+    const ctx = this.getContext();
+    if (!ctx || !this._master) return;
+    // Per-voice starts at 1; master bus carries the user volume so slider/mute
+    // never race a fadeTo(this.volume).
+    const voice = new Voice(ctx, sound, { looping: true, volume: 0, output: this._master });
+    voice.fadeTo(1, 3.33);
     this._current = { soundId, voice };
   }
 
   /**
-   * Pre-decode a sound so its first play() starts on the scheduled frame. A
-   * cold one-shot pays file read + decode at fire time — enough lag to make a
-   * correctly-timed impact sound land audibly late.
+   * Pre-decode a sound so its first play() starts on the scheduled frame.
    */
   warm(soundId) { return this._buffer(soundId); }
 
@@ -250,7 +293,7 @@ export class WeatherAudio {
    * ParticleSystem.playSoundEffect hook: a particle-attached one-shot or loop
    * with distance attenuation supplied by the caller. Callers that pass
    * volumeFn should keep calling handle.setAttenuation each frame so volume
-   * tracks the camera.
+   * tracks the camera. Master bus still scales the final output.
    */
   play(soundPointer, association, { looping = false, positionFn = null, volumeFn = null } = {}) {
     if (!this.enabled || this.volume <= 0 || !soundPointer) return null;
@@ -258,19 +301,16 @@ export class WeatherAudio {
     const backend = this;
     const applyVol = (h) => {
       if (h.stopped || !h.voice) return;
-      h.voice.setVolume(h.masterVolume * h.attenuation);
+      // Relative level only — master gain owns the user slider.
+      h.voice.setVolume(Math.max(0, h.attenuation));
     };
     const handle = {
       voice: null,
       stopped: false,
-      masterVolume: backend.volume,
       attenuation: 1,
       stop() { this.voice?.stop(); this.stopped = true; },
       isComplete() { return this.stopped || (this.voice ? this.voice.isComplete() : false); },
-      setMasterVolume(v) {
-        this.masterVolume = v;
-        applyVol(this);
-      },
+      setMasterVolume() { /* master bus handles this */ },
       setAttenuation(a) {
         this.attenuation = Math.max(0, a);
         if (this.attenuation <= 0 && this.voice) {
@@ -284,15 +324,15 @@ export class WeatherAudio {
 
     this._buffer(soundPointer.soundId).then((sound) => {
       if (!sound || handle.stopped || !backend.enabled || backend.volume <= 0) return;
-      const ctx = backend.getContext?.();
-      if (!ctx) return;
+      const ctx = backend.getContext();
+      if (!ctx || !backend._master) return;
       const attenuation = volumeFn ? (volumeFn(positionFn?.()) ?? 1) : 1;
       if (attenuation <= 0) return; // leave handle alive so AudioEmitter can retry when closer
       handle.attenuation = attenuation;
-      handle.masterVolume = backend.volume;
       handle.voice = new Voice(ctx, sound, {
         looping,
-        volume: handle.masterVolume * handle.attenuation,
+        volume: attenuation,
+        output: backend._master,
       });
     });
 
