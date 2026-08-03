@@ -8,6 +8,11 @@ import { FileTree } from './FileTree.jsx';
 import { MenuBar } from './MenuBar.jsx';
 import { NpcList } from './NpcList.jsx';
 import { CharacterList, useCharacter } from './CharacterList.jsx';
+import { CreationList, useCreation } from './CreationList.jsx';
+import {
+  buildCreationModel, parseSqleMotion, CreationAnimator, restoreCreationBind, CREATION_CLIPS,
+  creationCameraPaths, buildCreationCamera, CREATION_RACES,
+} from '../js/creation.js';
 import { AnimationPanel } from './AnimationPanel.jsx';
 import { Combo } from './Combo.jsx';
 import { MusicList, useAudioPlayer } from './MusicList.jsx';
@@ -81,9 +86,9 @@ function readZoneCamera(key) {
   const snap = readZoneCamMap()[key];
   return snap && Array.isArray(snap.target) ? snap : null;
 }
-const VIEWS = ['files', 'npc', 'pc', 'music', 'sfx', 'scene', 'zones', 'images', 'effects', 'data'];
+const VIEWS = ['files', 'npc', 'pc', 'creation', 'music', 'sfx', 'scene', 'zones', 'images', 'effects', 'data'];
 /** Views that browse individual models, where fly controls are a hindrance. */
-const ORBIT_VIEWS = new Set(['files', 'npc', 'pc']);
+const ORBIT_VIEWS = new Set(['files', 'npc', 'pc', 'creation']);
 /** Views with a Details panel — model/zone stats, or an effect's sprite images. */
 const DETAIL_VIEWS = new Set([...ORBIT_VIEWS, 'effects']);
 // Zones and Scene are two panels onto the same loaded zone, so moving between
@@ -94,6 +99,9 @@ const ZONE_VIEWS = new Set(['zones', 'scene']);
 // player, so leaving Zones has to stop it too — hence "was it an audio view",
 // not just "is it one now".
 const AUDIO_VIEWS = new Set(['music', 'sfx']);
+// Views that put their own content on screen as soon as they open. Restoring
+// one of these at startup must not also load the last/default DAT.
+const SELF_LOADING_VIEWS = new Set(['pc', 'creation', 'images', 'music', 'sfx', 'effects', 'data']);
 
 // A schedule sequence lays segments on a timeline; a joint whose segment hasn't
 // started yet would show bind pose (T-pose flash each loop). Underlay a looping
@@ -327,6 +335,10 @@ export default function App() {
     const v = localStorage.getItem(LAST_VIEW_KEY);
     return VIEWS.includes(v) ? v : 'files';
   });
+  // Mirrored for the startup effect, which runs once and must see the restored
+  // view without taking it as a dependency.
+  const leftViewRef = useRef(leftView);
+  leftViewRef.current = leftView;
   const setLeftView = useCallback((v) => {
     setLeftViewState(v);
     localStorage.setItem(LAST_VIEW_KEY, v);
@@ -404,6 +416,9 @@ export default function App() {
     const saved = Number(localStorage.getItem('fovDegrees'));
     return Number.isFinite(saved) && saved >= 20 && saved <= 120 ? saved : 45;
   });
+  // Mirrored so the cinematic camera can restore your FOV when it hands back.
+  const fovRef = useRef(fov);
+  fovRef.current = fov;
   const [showNavmesh, setShowNavmesh] = useState(false);
   const [showSkybox, setShowSkyboxState] = useState(() => localStorage.getItem('skybox') === '1');
   // Persisted skybox preference — kept across zone switches and sessions.
@@ -477,6 +492,11 @@ export default function App() {
     const renderer = new Renderer(canvasRef.current);
     renderer.screenOffsetX = explorerOpen ? 180 : 0;
     rendererRef.current = renderer;
+    // Dev-only escape hatch for driving/inspecting the renderer from the
+    // console (headless verification, quick probes). Not part of the app API.
+    // Exposed as the ref, not the instance — StrictMode mounts twice and a
+    // captured instance goes stale the moment the second one takes over.
+    if (import.meta.env.DEV) window.__cexiRendererRef = rendererRef;
     renderer.setFogOverride({ enabled: fogOn, scale: fogScale });
     renderer.camera.fovDegrees = fov;
     renderer.playbackSpeed = playbackSpeedRef.current;
@@ -1485,6 +1505,235 @@ export default function App() {
     onError: (msg) => setStatusText(msg),
   });
 
+  // --- Character Creation (high-poly RT/SHAPE + SQLE models) ----------------
+
+  const [crInfo, setCrInfo] = useState(null);
+  // Auto-detected poses inside the long sequence, and which one is playing
+  // (-1 = the whole clip). Picking one only re-windows the driver, no reload.
+  const [crSegments, setCrSegments] = useState([]);
+  const [crSegment, setCrSegment] = useState(-1);
+  // The camera is framed once, on the first model this view shows. Every later
+  // race/face/equipment/animation change keeps whatever view you set up — you
+  // are comparing them, so yanking the camera each time is worse than useless.
+  const crFramedRef = useRef(false);
+  // Authored camera track: which of the two cameras, whether it is driving, and
+  // the built track (kept in refs so the loader can read them without redoing).
+  const [crHasCamera, setCrHasCamera] = useState(false);
+  const [crCameraOn, setCrCameraOnState] = useState(false);
+  const [crCameraIndex, setCrCameraIndexState] = useState(0);
+  const crCameraOnRef = useRef(false);
+  const crCameraRef = useRef(0);
+  const crCameraTrackRef = useRef(null);
+  const setCrCameraOn = useCallback((on) => {
+    crCameraOnRef.current = on;
+    setCrCameraOnState(on);
+    const r = rendererRef.current;
+    if (r) r.creationCamera = on ? crCameraTrackRef.current : null;
+    // Handing the camera back leaves it wherever the last shot pointed, which
+    // is rarely a useful view — re-frame the performance.
+    if (!on && r?.creationDriver) {
+      const seq = r.creationDriver.sequenceBounds();
+      if (seq) r.camera.fit(seq.min, seq.max);
+      r.camera.fovDegrees = fovRef.current;
+    }
+  }, []);
+  const setCrCameraIndex = useCallback((i) => {
+    crCameraRef.current = i;
+    setCrCameraIndexState(i);
+  }, []);
+  // Assembled model cache: switching only the animation swaps motion drivers
+  // without re-reading and re-building the mesh/material DATs.
+  const crModelCacheRef = useRef({ key: '', model: null });
+  const crMotionCacheRef = useRef(new Map());   // rel path -> parsed motion
+
+  const loadCreation = useCallback(async (desc) => {
+    const settings = settingsRef.current;
+    if (!settings?.gamePath) { setStatusText('Game path not set — open Settings first.'); return; }
+    const gen = ++loadGenRef.current;
+    const stillCurrent = () => gen === loadGenRef.current;
+    let bodyMeshRel = desc.bodyMesh;
+    let bodyMatRel = desc.bodyMat;
+    let modelKey = [bodyMeshRel, bodyMatRel, desc.headMesh, desc.headMat, desc.headY].join('|');
+    let rebuild = crModelCacheRef.current.key !== modelKey || !crModelCacheRef.current.model;
+    const showOverlay = rebuild;
+    const releaseOverlay = () => { if (showOverlay && overlayGenRef.current === gen) endLoad(); };
+    try {
+      if (showOverlay) {
+        beginLoad(desc.name, 'Reading DAT…');
+        overlayGenRef.current = gen;
+      } else {
+        setStatusText(`Loading ${desc.name}…`);
+      }
+      const readRel = async (rel) => (await backend.readPrefer(gameCandidates(rel, settings))).data;
+
+      const buildWith = async (meshRel, matRel) => {
+        const [bodyMesh, bodyMat, headMesh, headMat] = await Promise.all([
+          readRel(meshRel),
+          readRel(matRel).catch(() => null),
+          readRel(desc.headMesh),
+          readRel(desc.headMat).catch(() => null),
+        ]);
+        stepLoad('Building model…');
+        await yieldToPaint();
+        const built = buildCreationModel([
+          { mesh: bodyMesh, mat: bodyMat, isBody: true },
+          { mesh: headMesh, mat: headMat, isBody: false, offsetY: desc.headY },
+        ], desc.name);
+        if (!built.isRenderable) throw new Error('no displayable creation geometry');
+        return built;
+      };
+
+      let model = crModelCacheRef.current.model;
+      if (rebuild) {
+        model = await buildWith(bodyMeshRel, bodyMatRel);
+        if (!stillCurrent()) { releaseOverlay(); return; }
+        crModelCacheRef.current = { key: modelKey, model };
+      }
+
+      const readMotion = async (rel) => {
+        const cache = crMotionCacheRef.current;
+        if (!cache.has(rel)) cache.set(rel, parseSqleMotion(await readRel(rel)));
+        return cache.get(rel);
+      };
+
+      // Matched body/head motion pair for the chosen animation (if any).
+      let driver = null;
+      let motions = null;
+      let swappedVariant = null;
+      if (desc.motions) {
+        if (showOverlay) stepLoad('Reading motion…');
+        const [bodyMo, headMo] = await Promise.all([
+          readMotion(desc.motions.body).catch(() => null),
+          readMotion(desc.motions.head).catch(() => null),
+        ]);
+        if (!stillCurrent()) { releaseOverlay(); return; }
+        motions = { body: bodyMo, head: headMo };
+        driver = new CreationAnimator(model, [bodyMo, headMo]);
+        // Tarutaru/Mithra/Galka carry a different skeleton per equipment
+        // variant, and each clip is authored for exactly one of them. Rather
+        // than freeze on a bind pose, rebuild on the variant that can play it.
+        if (!driver.compatible && desc.altBodyMesh) {
+          const alt = await buildWith(desc.altBodyMesh, desc.altBodyMat);
+          if (!stillCurrent()) { releaseOverlay(); return; }
+          const altDriver = new CreationAnimator(alt, [bodyMo, headMo]);
+          if (altDriver.compatible) {
+            model = alt;
+            bodyMeshRel = desc.altBodyMesh;
+            bodyMatRel = desc.altBodyMat;
+            modelKey = [bodyMeshRel, bodyMatRel, desc.headMesh, desc.headMat, desc.headY].join('|');
+            crModelCacheRef.current = { key: modelKey, model };
+            driver = altDriver;
+            rebuild = true;
+            swappedVariant = desc.altLabel;
+          }
+        }
+        if (!driver.compatible) driver = null;
+      }
+
+      if (!stillCurrent()) { releaseOverlay(); return; }
+      player.stop();
+      const renderer = rendererRef.current;
+      modelRef.current = model;
+      if (renderer.model !== model) renderer.setModel(model, crFramedRef.current);
+
+      if (driver) {
+        renderer.creationDriver = driver;
+        driver.bind(renderer);
+        renderer.setAnimation(driver.clip);
+        // Frame the whole performance, not the bind pose it starts from — but
+        // only the first time, so later changes leave the camera alone.
+        const seq = driver.sequenceBounds();
+        if (seq) {
+          if (!crFramedRef.current) renderer.camera.fit(seq.min, seq.max);
+          renderer.snapFloorToFeet({ min: seq.min, max: seq.max, footY: seq.max[1] });
+        }
+        crFramedRef.current = true;
+        renderer.playing = settingsRef.current?.autoPlay ?? true;
+        setPlayingState(renderer.playing);
+        setCrSegments(driver.segments);
+        setCrSegment(-1);
+
+        // Authored camera track — only the long sequence has one, and only it
+        // shares the sequence's frame count.
+        let camera = null;
+        if (desc.anim === 'seq') {
+          const race = CREATION_RACES.find((r) => r.id === desc.raceId);
+          const cams = creationCameraPaths(race);
+          const pick = cams[crCameraRef.current] ?? cams[0];
+          if (pick) {
+            const [fovMo, matMo] = await Promise.all([
+              readMotion(pick.fov).catch(() => null),
+              readMotion(pick.matrix).catch(() => null),
+            ]);
+            const built = buildCreationCamera(fovMo, matMo);
+            if (built && built.frameCount === driver.frameCount) camera = built;
+          }
+        }
+        setCrHasCamera(!!camera);
+        renderer.creationCamera = crCameraOnRef.current ? camera : null;
+        crCameraTrackRef.current = camera;
+      } else {
+        renderer.creationDriver = null;
+        renderer.setAnimation(null);
+        restoreCreationBind(renderer);
+        renderer.playing = false;
+        setPlayingState(false);
+        setCrSegments([]);
+        setCrSegment(-1);
+        crFramedRef.current = true;
+      }
+      appliedPlayRef.current = { kind: null, id: '' };
+      setAnims([]);
+      setSchedules([]);
+      setCurrentAnim('');
+      setCurrentSchedule('');
+      setModelPath(desc.name);
+      setSelectedDat(desc.bodyMesh.toLowerCase());
+      shownPathRef.current = `${settings.gamePath}\\${normRel(desc.bodyMesh)}`;
+      sourcePathRef.current = shownPathRef.current;
+
+      const cr = model.creation;
+      setCrInfo({
+        bones: cr.bones.length,
+        verts: cr.groups.reduce((n, g) => n + g.vertCount, 0),
+        shapes: cr.groups.length,
+        motion: desc.motions ? {
+          kind: motions?.body?.kind ?? 'frame',
+          frames: motions?.body?.frameCount ?? 0,
+          duration: motions?.body?.duration ?? 0,
+          fps: motions?.body?.fps ?? 30,
+          body: desc.motions.body,
+          head: desc.motions.head,
+          compatible: !!driver,
+          movingBones: driver?.movingBoneCount ?? 0,
+          totalBones: cr.bones.length,
+          // Set when this clip could only play on the other equipment body.
+          shownOn: swappedVariant,
+          repaired: driver?.repairedFrames ?? 0,
+        } : null,
+      });
+      releaseOverlay();
+      const mismatch = desc.motions && !driver
+        ? ` — motion channels (${motions?.body?.channelCount ?? '?'}/${motions?.head?.channelCount ?? '?'})`
+          + ` don't match the skeleton pair (${cr.channelSums.join('/')}); showing bind pose`
+        : '';
+      setStatusText(driver
+        ? `${desc.name} — ${driver.frameCount.toLocaleString()} frames, ${driver.duration.toFixed(1)}s`
+          + `${swappedVariant ? ` (shown on the ${swappedVariant} body — this clip is authored for it)` : ''}`
+        : `${desc.name}${desc.motions ? mismatch : ' — A-pose'}`);
+    } catch (err) {
+      console.error(err);
+      releaseOverlay();
+      if (stillCurrent()) setStatusText(`${desc.name} — failed: ${err.message ?? err}`);
+    }
+  }, [beginLoad, stepLoad, endLoad, player]);
+
+  const cr = useCreation({
+    enabled: leftView === 'creation' && !!settings?.gamePath,
+    onLoad: loadCreation,
+    onError: (msg) => setStatusText(msg),
+  });
+
   // --- startup -------------------------------------------------------------
 
   useEffect(() => {
@@ -1552,21 +1801,30 @@ export default function App() {
         if (lastZone) {
           setLeftView('zones');
           await loadZone(lastZone);
+          // Restoring a zone on launch puts you back in a walkable world, so
+          // give the fly controls back — loadZone only auto-enables them for a
+          // zone it has no saved camera for, which never happens on a reload.
+          if (settingsRef.current?.autoWasdZones !== false) setWasd(true);
           return;
         }
 
-        if (!paths) {
-          paths = [`${gamePath}\\${DEFAULT_DAT_SUFFIX}`];
-          name = DEFAULT_DAT_SUFFIX;
+        // Views that load their own content on arrival must not race the
+        // restored/default DAT: it resolves later and replaces what they put
+        // on screen (Character Creation came up showing ROM/5/3.DAT).
+        if (!SELF_LOADING_VIEWS.has(leftViewRef.current)) {
+          if (!paths) {
+            paths = [`${gamePath}\\${DEFAULT_DAT_SUFFIX}`];
+            name = DEFAULT_DAT_SUFFIX;
+          }
+          await loadModel(paths, name, lastOpts ?? {});
+          setRevealTarget(paths[paths.length - 1].toLowerCase());
         }
-        await loadModel(paths, name, lastOpts ?? {});
-        setRevealTarget(paths[paths.length - 1].toLowerCase());
       } catch (err) {
         console.error(err);
         setStatusText(`Startup failed: ${err.message ?? err}`);
       }
     })();
-  }, [loadModel, loadZone]);
+  }, [loadModel, loadZone, setWasd]);
 
   // Debug/verification hook (used by the headless capture flow)
   useEffect(() => {
@@ -1663,6 +1921,47 @@ export default function App() {
   const animControls = {
     anims, currentAnim, onAnimChange: handleAnimChange,
     schedules, currentSchedule, onScheduleChange: handleScheduleChange,
+    playing, onTogglePlay: () => setPlaying(!playing),
+    frameSink: animTick, onSeek: (f) => rendererRef.current?.seekTo(f),
+    speed: playbackSpeed, onSpeed: setPlaybackSpeed,
+  };
+
+  // Character Creation playback: idle, the long creation presentation, and the
+  // individual poses auto-detected inside it (the file concatenates several,
+  // separated by long holds). '— bind pose —' doubles as the A-pose. Transport,
+  // scrubber and speed ride the same renderer playhead as ordinary clips.
+  const crSecs = (n) => `${Math.floor(n / 60)}:${String(Math.floor(n % 60)).padStart(2, '0')}`;
+  const crFps = rendererRef.current?.creationDriver?.fps || 30;
+  const creationAnim = {
+    anims: [
+      ...CREATION_CLIPS.map((c) => ({ id: c.id, label: c.label, clip: {} })),
+      // Poses detected inside the long sequence (it concatenates several).
+      ...crSegments.map((s, i) => ({
+        id: `seg:${i}`,
+        label: `  ↳ Pose ${i + 1} (${crSecs(s.start / crFps)}–${crSecs((s.start + s.count) / crFps)})`,
+        clip: {},
+      })),
+    ],
+    currentAnim: crSegment >= 0 ? `seg:${crSegment}` : cr.anim,
+    onAnimChange: (id) => {
+      const driver = rendererRef.current?.creationDriver;
+      const seg = typeof id === 'string' && id.startsWith('seg:') ? +id.slice(4) : -1;
+      if (seg >= 0 && driver && crSegments[seg]) {
+        driver.setRange(crSegments[seg].start, crSegments[seg].count);
+        rendererRef.current.setAnimation(driver.clip);
+        rendererRef.current.playing = true;
+        setPlayingState(true);
+        setCrSegment(seg);
+        return;
+      }
+      setCrSegment(-1);
+      if (driver && id === cr.anim) {   // same clip — back to its full range
+        driver.setRange(0, null);
+        rendererRef.current.setAnimation(driver.clip);
+        return;
+      }
+      cr.setAnim(id ?? '');
+    },
     playing, onTogglePlay: () => setPlaying(!playing),
     frameSink: animTick, onSeek: (f) => rendererRef.current?.seekTo(f),
     speed: playbackSpeed, onSpeed: setPlaybackSpeed,
@@ -1872,7 +2171,9 @@ export default function App() {
     modelRef.current = null;
     zoneCamKeyRef.current = '';
     // Zone ambience is driven by the particle system, which setModel just threw
-    // away — detach so the weather bed stops instead of holding its last voice.
+    // away. Detaching alone leaves already-playing voices running, so stop them
+    // all — the bed, the crossfading pair, and any one-shots in flight.
+    weatherAudioRef.current?.stopAll();
     weatherAudioRef.current?.attach(null, null);
     appliedPlayRef.current = { kind: null, id: '' };
     setModelInfo(null);
@@ -1902,18 +2203,31 @@ export default function App() {
     // reloads itself on arrival, so unloading here just clears the old actor.
     if (!(ZONE_VIEWS.has(prev) && ZONE_VIEWS.has(leftView))) unloadModel();
     if (!(AUDIO_VIEWS.has(prev) && AUDIO_VIEWS.has(leftView))) player.stop();
+    // Leaving the zone views silences the zone outright: the BGM and every
+    // ambient/weather voice, including one-shots already in flight. Detaching
+    // the particle system alone leaves those playing, which is why zone sound
+    // followed you into other pages.
+    if (!ZONE_VIEWS.has(leftView)) {
+      player.stop();
+      weatherAudioRef.current?.stopAll();
+      setZoneTrack(null);
+      zoneMusicIdRef.current = null;
+    }
     if (leftView !== 'images') { setImageEntry(null); setImageDoc(null); setImageSet(null); }
     if (leftView !== 'data') { setDataDoc(null); dataBufRef.current = null; dataTexturesRef.current = null; }
     setShowAxes(leftView === 'effects');   // per-view default; the toggle still overrides
     // Leaving Effects: unloadModel already tore down the particle scene; drop the
     // selection so returning starts clean instead of showing dead transport rows.
+    // Re-entering Character Creation frames the model once more; while you are
+    // in it, the camera is yours.
+    if (leftView !== 'creation') crFramedRef.current = false;
     if (prev === 'effects' && leftView !== 'effects') {
       effectRoutinesRef.current = [];
       setEffectEntry(null);
       setEffectRoutines([]);
       setEffectSchedule('');
     }
-  }, [leftView, unloadModel, player]);
+  }, [leftView, unloadModel, player, setZoneTrack]);
 
   const loadImage = useCallback(async (entry) => {
     const settings = settingsRef.current;
@@ -2236,6 +2550,9 @@ export default function App() {
       case 'assets-characters':
         setLeftView('pc');
         break;
+      case 'assets-creation':
+        setLeftView('creation');
+        break;
       case 'assets-music':
         setLeftView('music');
         break;
@@ -2417,6 +2734,19 @@ export default function App() {
         />
       )}
       {explorerOpen && leftView === 'pc' && <CharacterList pc={pc} />}
+      {explorerOpen && leftView === 'creation' && (
+        <CreationList
+          cr={cr}
+          info={crInfo}
+          camera={{
+            available: crHasCamera,
+            on: crCameraOn,
+            onToggle: setCrCameraOn,
+            index: crCameraIndex,
+            onIndex: setCrCameraIndex,
+          }}
+        />
+      )}
       {explorerOpen && leftView === 'music' && (
         <MusicList
           gamePath={settings?.gamePath ?? ''}
@@ -2544,7 +2874,10 @@ export default function App() {
       {/* Only the views that actually put a model on screen get playback
           controls — Images/Music/SFX have their own right-hand panels. */}
       {!player.current && ORBIT_VIEWS.has(leftView) && (
-        <AnimationPanel pc={leftView === 'pc' ? pc : null} anim={animControls} />
+        <AnimationPanel
+          pc={leftView === 'pc' ? pc : null}
+          anim={leftView === 'creation' ? creationAnim : animControls}
+        />
       )}
 
       {/* Standalone effect: Schedule picker + transport + speed (no scrubber —

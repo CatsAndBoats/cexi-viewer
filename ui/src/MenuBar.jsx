@@ -47,6 +47,10 @@ const MENUS = [
       { id: 'assets-music', label: 'Music', icon: 'music_note' },
       { id: 'assets-sfx', label: 'Sound FX', icon: 'graphic_eq' },
       { id: 'assets-scene', label: 'Scene', icon: 'grass' },
+      // Set apart at the bottom: still work in progress (the creation sequence
+      // needs its event layer, and per-shape textures are not mapped yet).
+      { sep: true },
+      { id: 'assets-creation', label: '(WIP) Character Creation', icon: 'person_add' },
     ],
   },
 ];
@@ -208,7 +212,8 @@ export function MenuBar({ onAction, checks = {}, flySpeed = 0, fov = 45, onFov }
             ref={panelRef}
             style={{ position: 'fixed', left: active.left, top: active.top }}
           >
-            {activeMenu.items.map((item) => {
+            {activeMenu.items.map((item, i) => {
+              if (item.sep) return <div key={`sep${i}`} className="menu-divider" role="separator" />;
               const disabled = !!(item.disabled || (item.disableWhen && checks[item.disableWhen]));
               return (
                 <button

@@ -668,6 +668,8 @@ export class Renderer {
     this.model = model;
     this.pose = null;
     this.poseDirty = true;
+    this.creationDriver = null;   // CPU animator for high-poly creation models
+    this.creationCamera = null;   // authored camera track (see creation.js)
 
     if (!model || !model.isRenderable) return;
 
@@ -1019,6 +1021,12 @@ export class Renderer {
 
   _drawSkeleton(viewProj) {
     const gl = this.gl;
+    // Creation models don't pose the GPU skeleton (they are CPU-skinned against
+    // their own combined body+head rig), so draw that rig instead — otherwise
+    // the toggle shows a single dummy joint and tells you nothing about whether
+    // the bones are animating.
+    const creation = this.model?.kind === 'creation' ? this.creationDriver : null;
+    if (creation?.worlds?.length) { this._drawCreationSkeleton(viewProj, creation); return; }
     const joints = this.pose?.skeleton?.joints;
     if (!joints?.length) return;
 
@@ -1054,6 +1062,67 @@ export class Renderer {
     const count = v / 6;
     if (!count) return;
 
+    gl.bindBuffer(gl.ARRAY_BUFFER, lines.vbo);
+    gl.bufferData(gl.ARRAY_BUFFER, d.subarray(0, v), gl.DYNAMIC_DRAW);
+    gl.useProgram(this.overlayProgram);
+    gl.uniformMatrix4fv(this.overlayUniforms.viewProj, false, viewProj);
+    gl.uniform1f(this.overlayUniforms.opacity, 1);
+    gl.disable(gl.BLEND);
+    gl.disable(gl.DEPTH_TEST);
+    gl.depthMask(false);
+    gl.bindVertexArray(lines.vao);
+    gl.drawArrays(gl.LINES, 0, count);
+    gl.bindVertexArray(null);
+    gl.enable(gl.DEPTH_TEST);
+    gl.depthMask(true);
+  }
+
+  /**
+   * The combined body+head rig of a creation model, drawn from the animator's
+   * live world matrices. Body bones are blue, head bones amber, and any bone
+   * whose own rotation never changes across the clip is drawn red — so "is
+   * every bone animating?" is answerable by looking.
+   */
+  _drawCreationSkeleton(viewProj, driver) {
+    const gl = this.gl;
+    const bones = this.model.creation.bones;
+    if (!this.skeletonLines) {
+      const vbo = gl.createBuffer();
+      const vao = gl.createVertexArray();
+      gl.bindVertexArray(vao);
+      gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+      gl.enableVertexAttribArray(0);
+      gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 24, 0);
+      gl.enableVertexAttribArray(1);
+      gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 24, 12);
+      gl.bindVertexArray(null);
+      this.skeletonLines = { vao, vbo, data: new Float32Array(0) };
+    }
+    const lines = this.skeletonLines;
+    if (lines.data.length < bones.length * 12) lines.data = new Float32Array(bones.length * 12);
+    const still = driver.staticBones;
+    const d = lines.data;
+    let v = 0;
+    for (let i = 0; i < bones.length; i++) {
+      const p = bones[i].parent;
+      if (p < 0) continue;
+      const a = driver.worlds[p];
+      const b = driver.worlds[i];
+      if (!a || !b) continue;
+      // red = this bone's own rotation is constant for the whole clip
+      const dead = still ? still[i] : 0;
+      const head = bones[i].fileIndex === 1;
+      const r = dead ? 1.0 : (head ? 0.95 : 0.20);
+      const g = dead ? 0.15 : (head ? 0.70 : 0.55);
+      const bl = dead ? 0.15 : (head ? 0.20 : 0.75);
+      d[v] = a[9]; d[v + 1] = a[10]; d[v + 2] = a[11];
+      d[v + 3] = r * 0.4; d[v + 4] = g * 0.4; d[v + 5] = bl * 0.4;
+      d[v + 6] = b[9]; d[v + 7] = b[10]; d[v + 8] = b[11];
+      d[v + 9] = r; d[v + 10] = g; d[v + 11] = bl;
+      v += 12;
+    }
+    const count = v / 6;
+    if (!count) return;
     gl.bindBuffer(gl.ARRAY_BUFFER, lines.vbo);
     gl.bufferData(gl.ARRAY_BUFFER, d.subarray(0, v), gl.DYNAMIC_DRAW);
     gl.useProgram(this.overlayProgram);
@@ -1279,7 +1348,9 @@ export class Renderer {
 
     const vbo = gl.createBuffer();
     gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
-    gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+    // Creation pieces are re-skinned on the CPU and re-uploaded per animation
+    // frame (see creation.js CreationAnimator), so their buffers stay dynamic.
+    gl.bufferData(gl.ARRAY_BUFFER, data, piece.dynamic ? gl.DYNAMIC_DRAW : gl.STATIC_DRAW);
 
     const vao = gl.createVertexArray();
     gl.bindVertexArray(vao);
@@ -1311,7 +1382,7 @@ export class Renderer {
         : piece.alphaMode === 'blend' ? 3
           : 0;
 
-    return {
+    const batch = {
       vao,
       vbo,
       wireEbo,
@@ -1322,6 +1393,14 @@ export class Renderer {
       alphaMode,
       layer: piece.layer || 'world', // 'world' | 'env' (sky/water)
     };
+    if (piece.dynamic) {
+      // The animator needs the CPU-side copy and the corner -> pool-vertex map
+      // to rewrite positions/normals in place.
+      batch.data = data;
+      batch.corners = Uint32Array.from(piece.corners, (c) => c.vi);
+      batch.creationGroup = piece.creationGroup;
+    }
+    return batch;
   }
 
   createTexture(image, opts = {}) {
@@ -1388,11 +1467,30 @@ export class Renderer {
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
     if (this.playing && this.currentAnimation && this.pose) {
-      this.animFrame += dtSeconds * 30 * this.playbackSpeed;   // 30 game-frames/sec, scaled
+      // 30 game-frames/sec, scaled — unless the clip declares its own rate
+      // (high-poly creation motions run at ~30 or ~61 depending on encoding).
+      this.animFrame += dtSeconds * (this.currentAnimation.fps ?? 30) * this.playbackSpeed;
       const len = this.currentAnimation.lengthInFrames;
       if (this.animFrame > len) this.animFrame %= len;
       this.pose.evaluate(this.currentAnimation, this.animFrame);
       this.poseDirty = true;
+    }
+    // Creation models animate on the CPU: pick up the playhead every frame
+    // (advance above, or a seek while paused) — apply() no-ops on a repeat.
+    if (this.creationDriver && this.model?.kind === 'creation') {
+      this.creationDriver.apply(this.animFrame);
+      // The authored camera track, when enabled: the creation screen's motion
+      // is mostly camera work, so this is what makes the sequence read right.
+      if (this.creationCamera) {
+        const shot = this.creationCamera.at(this.creationDriver.rangeStart + this.animFrame);
+        const cam = this.camera;
+        cam.mode = 'fly';
+        cam.pos = shot.eye;
+        cam.yaw = Math.atan2(shot.forward[0], shot.forward[2]);
+        const horiz = Math.hypot(shot.forward[0], shot.forward[2]) || 1e-6;
+        cam.pitch = cam.yUp ? Math.atan2(shot.forward[1], horiz) : Math.atan2(-shot.forward[1], horiz);
+        cam.fovDegrees = this.creationCamera.fovDegrees;
+      }
     }
 
     // xim WindFactor.update: step 1/60 per game frame (30fps) → 2s per leg.

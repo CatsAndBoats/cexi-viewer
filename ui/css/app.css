@@ -253,6 +253,12 @@
 .menu-item:hover:not(:disabled) .icon { color: var(--gray-200); }
 .menu-item .mi-label { flex: 1 1 auto; font-size: 14px; }
 .menu-item .mi-check { color: var(--accent); }
+/* Horizontal rule between groups of menu items (see MenuBar `{ sep: true }`). */
+.menu-divider {
+  height: 1px;
+  margin: 4px 9px;
+  background: rgba(255, 255, 255, 0.14);
+}
 
 /* --- Left panel (file tree / NPC list) ------------------------------------ */
 
